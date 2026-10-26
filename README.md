@@ -1,6 +1,18 @@
 # opencode-workbuddy-auth-jsonimport
 
-在官方插件 **`@magpie-community/opencode-workbuddy-auth@0.1.36`** 基础上，**新增第三种登录方式：「导入登录 JSON」**。其余行为与官方版完全一致（供应商 id 仍为 `workbuddy` / `workbuddy-ai`）。
+在官方插件 **`@magpie-community/opencode-workbuddy-auth@0.1.36`** 基础上，**新增第三种登录方式：「导入登录 JSON」**。其余行为与官方版一致，但用独立的供应商 id（见下），可与官方插件共存。
+
+
+## 供应商 id（与官方插件共存）
+
+为避免和官方 `@magpie-community/opencode-workbuddy-auth` 冲突，本 fork 用**独立的供应商 id**：
+
+| 本插件 | 官方插件 |
+|---|---|
+| `workbuddy-import`（显示名 `WorkBuddy (JSON 导入)`） | `workbuddy` |
+| `workbuddy-ai-import`（显示名 `WorkBuddy AI (JSON 导入)`） | `workbuddy-ai` |
+
+`authID`、`platform`、接口地址与官方一致，只换了供应商 id 和显示名，因此两者可同时安装。
 
 ## 新增：导入登录 JSON
 

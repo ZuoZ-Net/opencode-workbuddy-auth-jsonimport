@@ -61,8 +61,8 @@ const AI_MODELS = [
 
 const SITES = {
   workbuddy: {
-    id: "workbuddy",
-    name: "WorkBuddy",
+    id: "workbuddy-import",
+    name: "WorkBuddy (JSON 导入)",
     endpoint: "https://copilot.tencent.com",
     authID: "workbuddy-desktop",
     platform: "workbuddy",
@@ -73,8 +73,8 @@ const SITES = {
     messages: true,
   },
   "workbuddy-ai": {
-    id: "workbuddy-ai",
-    name: "WorkBuddy AI",
+    id: "workbuddy-ai-import",
+    name: "WorkBuddy AI (JSON 导入)",
     endpoint: "https://www.workbuddy.ai",
     authID: "workbuddy-desktop-ai",
     platform: "workbuddy-ai",

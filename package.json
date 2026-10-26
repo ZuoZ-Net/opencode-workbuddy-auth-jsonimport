@@ -1,11 +1,21 @@
 {
   "name": "opencode-workbuddy-auth-jsonimport",
-  "version": "0.1.0",
-  "description": "WorkBuddy (CodeBuddy) OpenCode/magpie provider plugin with an added 'import sign-in JSON' method. Fork of @magpie-community/opencode-workbuddy-auth 0.1.36.",
+  "version": "0.2.0",
+  "description": "WorkBuddy (CodeBuddy) provider plugin with an 'import sign-in JSON' method; registers distinct provider ids (workbuddy-import / workbuddy-ai-import) so it coexists with the official @magpie-community/opencode-workbuddy-auth.",
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
-  "files": ["index.mjs", "README.md", "LICENSE"],
-  "keywords": ["opencode", "opencode-plugin", "magpie-plugin", "workbuddy", "codebuddy"],
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie-plugin",
+    "workbuddy",
+    "codebuddy"
+  ],
   "license": "MIT"
 }
