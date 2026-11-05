@@ -1,7 +1,8 @@
 # opencode-workbuddy-auth-jsonimport
 
-在官方插件 **`@magpie-community/opencode-workbuddy-auth@0.1.36`** 基础上，**新增第三种登录方式：「导入登录 JSON」**。其余行为与官方版一致，但用独立的供应商 id（见下），可与官方插件共存。
+在官方插件 **`@magpie-community/opencode-workbuddy-auth@0.2.20`** 基础上，**新增一种登录方式：「导入登录 JSON」**。其余行为与官方版一致，但用独立的供应商 id（见下），可与官方插件共存。
 
+> 基线版本：官方 `0.2.20`（2026-11-03）。本包版本 `0.2.20-import.1`。升级官方版时，把下面「改动说明」里的几处重新应用到新版本即可。
 
 ## 供应商 id（与官方插件共存）
 
@@ -14,14 +15,17 @@
 
 `authID`、`platform`、接口地址与官方一致，只换了供应商 id 和显示名，因此两者可同时安装。
 
-## 新增：导入登录 JSON
+## 登录方式
 
-官方版原有两种登录：
+官方 0.2.20 已有三种登录：
+
 1. `… account (browser)` —— 浏览器登录
 2. `… desktop's sign-in` —— 读 WorkBuddy 桌面端已登录的文件
+3. `… API key` —— 填在 WorkBuddy 后台生成的 API key
 
-本版新增第三种：
-3. **`… 导入登录 JSON`** —— 弹出粘贴框（`method: "code"`），把 WorkBuddy 的登录 JSON 贴进去。
+本版新增第四种：
+
+4. **`… 导入登录 JSON`** —— 弹出粘贴框（`method: "code"`），把 WorkBuddy 的登录 JSON 贴进去。
 
 适用场景：这台机器没装 WorkBuddy 桌面端、或要把一个登录搬到另一台机器时。
 
@@ -52,17 +56,23 @@ WorkBuddy 桌面端 auth 目录下那个 `.info` 文件的**完整内容**，形
 
 ## 安装
 
-magpie 窗口 → 插件页 → 添加插件 → 填文件夹路径：
+magpie 窗口 → 插件页 → 添加插件 → 填本插件文件夹路径（例如把本包解压到）：
 
     D:\Ai\magpie-plugins\workbuddy-auth-jsonimport
 
 然后在 Providers → WorkBuddy 那一行选「导入登录 JSON」，粘贴登录 JSON。
 
-## 改动说明（相对官方 0.1.36）
+> Docker 部署 magpie 时，把本包目录放进 magpie 的插件卷（如 `magpie-config/_data/magpie/plugins/...`），在插件页填容器内对应路径，重启生效。
 
-`index.mjs` 只加了两段、未改原逻辑：
-- 新函数 `parseImport()`（解析粘贴的 JSON）和 `importSignIn()`（第三种登录方式）。
-- 在 `auth.methods` 数组末尾加了第三项。
+## 改动说明（相对官方 0.2.20）
+
+官方 0.2.20 把包拆成了三个文件：`opencode.mjs`（OpenCode 1.x 入口，re-export）、`opencode2.mjs`（OpenCode 2.x 适配，原样照搬）、`index.mjs`（主体）。本 fork **只改 `index.mjs`**，共四处、未改原逻辑：
+
+- `SITES` 里把 `workbuddy` / `workbuddy-ai` 两个站点的 **`id` 和 `name`** 改成 `-import` 版（见上表）。
+- 新增两个函数 **`parseImport()`**（解析粘贴的登录 JSON）和 **`importSignIn()`**（第四种登录方式），紧跟在 `success()` 之后。
+- 在 `auth.methods` 数组里（桌面登录与 API key 之间）加了「导入登录 JSON」一项。
 - `_internal` 导出里加了 `importSignIn`、`parseImport`，方便测试。
 
-升级官方版时，把这两段重新应用到新版本即可。
+`opencode.mjs` / `opencode2.mjs` / `package.json` 的 `main`、`exports` 结构与官方一致；`package.json` 只改了 `name`、`version`、`description`。
+
+升级官方版时，把以上四处重新应用到新版本的 `index.mjs` 即可。
