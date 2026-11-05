@@ -6,15 +6,16 @@
 // the token as WorkBuddy's desktop app does) or is taken from WorkBuddy
 // desktop's own sign-in. Its chats are chat completions at <endpoint>/v2,
 // streamed only, with WorkBuddy's headers: a request whose User-Agent isn't
-// WorkBuddy/<version> is refused (error 10085).
+// WorkBuddy/<version> is refused (error 10085). Each build's headers are
+// those of its current desktop app (see SITES' app, cli and appName).
 
 import { createHash, randomBytes } from "node:crypto"
-import { readFileSync } from "node:fs"
+import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { isAbsolute, join } from "node:path"
+import { gzipSync } from "node:zlib"
 
 const APP_VERSION = "2.0.0" // the version WorkBuddy's sign-in page is opened with
-const UA_VERSION = "5.5.6" // WorkBuddy/<this> is the User-Agent the API takes
 const POLL_MS = 1000
 const SIGN_IN_MS = 5 * 60 * 1000
 const EARLY_MS = 60 * 1000 // a token this close to its end is refreshed before a request
@@ -27,7 +28,7 @@ const CN_MODELS = [
   ["hy4-preview-f", "Hy4 preview", 1000000, ["high"]],
   ["hy3", "Hy3", 192000, ["low", "high"]],
   ["hy3-x", "Hy3-X", 192000, ["low", "high"]],
-  ["deepseek-v4.1-flash", "Deepseek-V4.1-Flash", 1000000],
+  ["deepseek-v4.1-flash", "Deepseek-V4.1-Flash", 1000000, ["none", "low", "high", "max"]],
   ["glm-5.3", "GLM-5.3", 1000000, ["low", "high", "max"]],
   ["glm-5.3-flash", "GLM-5.3-Flash", 1000000, ["low", "high", "max"]],
   ["glm-5.2", "GLM-5.2", 1000000, ["high", "xhigh"]],
@@ -67,6 +68,18 @@ const SITES = {
     authID: "workbuddy-desktop",
     platform: "workbuddy",
     ai: false,
+    // the desktop app the requests are WorkBuddy's own client's of: its
+    // version, its bundled CLI's (@genie/agent-cli), and the CLI's
+    // product.json applicationName. Read from WorkBuddy 5.9.3.42398134,
+    // the update feed's current build on 2026-10-28.
+    app: "5.9.3",
+    cli: "2.165.0",
+    appName: "WorkBuddy",
+    // 5.9's CLI says on each chat where the agent runs; the desktop's own
+    // is "local-agent" (X-Agent-Runtime, absent in 5.8)
+    runtime: "local-agent",
+    // where this build's API keys are made (see keyAccount)
+    keys: "https://www.workbuddy.cn/profile/keys",
     models: CN_MODELS,
     // it serves the Claude models on Anthropic's Messages API too (see
     // nativeOf)
@@ -79,12 +92,44 @@ const SITES = {
     authID: "workbuddy-desktop-ai",
     platform: "workbuddy-ai",
     ai: true,
+    // WorkBuddy AI 5.9.3.42398134, its update feed's current build on
+    // 2026-10-29 (see the China build's): the same CLI as the China
+    // build's 5.9.3, byte for byte but for product.json, and the same
+    // Electron (37.10.3); its desktop puts agentRuntime local-agent in the
+    // prompt meta as the China build's does
+    app: "5.9.3",
+    cli: "2.165.0",
+    appName: "workbuddy-ai",
+    runtime: "local-agent",
+    keys: "https://www.workbuddy.ai/profile/keys",
     models: AI_MODELS,
     // models whose images WorkBuddy AI drops though its config says they
     // take them (see textOnly)
     noImages: /^glm-/,
   },
 }
+
+// A model's context is its config's maxInputTokens, on both sites. 0.2.7
+// capped deepseek-v4.1-flash at 100000 on copilot.tencent.com from one
+// report's error ("prompt is too long: 100001 tokens > 100000 maximum"),
+// and it was wrong: on 2026-10-31 China Free-plan accounts of three other
+// users took 110,041 to 992,389-token prompts on it there, the whole prompt
+// read (needles recalled), and the vendor's own refusal of 1,157,831 named
+// 1048576 as the maximum (plugins#561). The cap made every client compact at
+// 100k. Where a prompt really is too long, WorkBuddy's 400 says "prompt is
+// too long" and goes to the client as it came (explained), which magpie
+// reads as the context overflowing (context_length_exceeded): the agent is
+// told to compact, and the account isn't rested for it.
+
+// OFF_TAKEN are models that turn thinking off for reasoning_effort "none"
+// though the config says onlyReasoning (so WorkBuddy's own client offers no
+// off switch): deepseek-v4.1-flash, and the same model under its paid id.
+// Measured 2026-10-31 on www.workbuddy.ai: "none" answered 200 with 0
+// reasoning tokens on both, where "low" thought 1221 and 1127; and on the
+// China build by the reporter of plugins#563 (0 reasoning tokens, a 30-item
+// prompt in 14s instead of 50s). Without the level magpie sends "low" for
+// a client's "none".
+const OFF_TAKEN = new Set(["deepseek-v4.1-flash", "deepseek-v4.1-flash-sg"])
 
 // textOnly says whether site drops the images sent to model, whatever its
 // config says. On 2026-10-13, with a real WorkBuddy AI account (Yirasumi on
@@ -152,7 +197,7 @@ async function call(site, method, path, headers = {}, body) {
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json",
-      "User-Agent": "WorkBuddy/" + UA_VERSION,
+      "User-Agent": "WorkBuddy/" + site.app,
       ...headers,
     },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -299,19 +344,87 @@ async function refreshed(site, auth) {
 function sign(site, a, headers) {
   headers.set("Authorization", "Bearer " + a.access)
   headers.set("X-User-Id", a.uid ?? "")
-  headers.set("X-Domain", domainOf(site, a))
+  if (a.source === "key") {
+    // the key's own header, and no X-Domain: a key's session has none
+    headers.set("X-API-Key", a.key)
+    headers.delete("X-Domain")
+  } else {
+    headers.delete("X-API-Key")
+    headers.set("X-Domain", domainOf(site, a))
+  }
   headers.set("X-Product", "SaaS")
   headers.set("X-IDE-Type", "WorkBuddy")
-  headers.set("User-Agent", "WorkBuddy/" + UA_VERSION)
+  headers.set("User-Agent", cliAgent(site))
   headers.set("X-Requested-With", "XMLHttpRequest")
   headers.set("X-Agent-Intent", "craft")
   headers.set("X-Agent-Purpose", "conversation")
   headers.set("X-IDE-Name", "WorkBuddy")
-  headers.set("X-IDE-Version", UA_VERSION)
+  headers.set("X-IDE-Version", site.app)
   for (const [k, v] of Object.entries(enterpriseHeaders(a))) headers.set(k, v)
-  if (!site.ai) return
-  headers.set("X-Agent-Type", "main")
 }
+
+// cliAgent is the User-Agent WorkBuddy's desktop CLI sends its API calls
+// (a chat, the product config) with: UserAgentHttpInterceptor's
+// buildUserAgent puts the platform (CLIENT_INFO_PLATFORM "WorkBuddy", at
+// the app's version) first, then the CLI's applicationName at the same
+// version, then CLIENT_INFO_USER_AGENT_EXTENSION, "CLI/<its version>".
+function cliAgent(site) {
+  return `WorkBuddy/${site.app} ${site.appName}/${site.app} CLI/${site.cli}`
+}
+
+// OPENAI_SDK and NODE are what the CLI's chats go out through: the OpenAI
+// SDK it bundles (openai 6.25.0) and the Node its Electron runs it on
+// (Electron 37.10.3, ELECTRON_RUN_AS_NODE).
+const OPENAI_SDK = "6.25.0"
+const NODE = "v22.21.1"
+const SDK_OS = { darwin: "MacOS", win32: "Windows", linux: "Linux", freebsd: "FreeBSD", openbsd: "OpenBSD", android: "Android" }
+const SDK_ARCH = { x64: "x64", arm64: "arm64", arm: "arm", ia32: "x32", x32: "x32" }
+
+// chatHeaders sets on a chat what WorkBuddy's CLI adds to its model
+// requests alone (axiosToFetchAdapter, both builds): the agent type
+// (resolveModelCallAgentType, "main" for the conversation's own agent),
+// the runtime where a build sends one, and the OpenAI SDK's own headers,
+// which the CLI's fetch passes on. Its client has a 1200s timeout and
+// no retries of its own.
+function chatHeaders(site, headers) {
+  headers.set("X-Agent-Type", "main")
+  if (site.runtime) headers.set("X-Agent-Runtime", site.runtime)
+  else headers.delete("X-Agent-Runtime")
+  headers.set("Accept", "application/json")
+  headers.set("X-Stainless-Retry-Count", "0")
+  headers.set("X-Stainless-Timeout", "1200")
+  headers.set("X-Stainless-Lang", "js")
+  headers.set("X-Stainless-Package-Version", OPENAI_SDK)
+  headers.set("X-Stainless-OS", SDK_OS[process.platform] ?? (process.platform ? `Other:${process.platform}` : "Unknown"))
+  headers.set("X-Stainless-Arch", SDK_ARCH[process.arch] ?? (process.arch ? `other:${process.arch}` : "unknown"))
+  headers.set("X-Stainless-Runtime", "node")
+  headers.set("X-Stainless-Runtime-Version", NODE)
+}
+
+// keyAccount is the account an API key (OpenCode's {type: "api", key}) is
+// sent as, the way WorkBuddy's own CLI sends one (@tencent-ai/codebuddy-code
+// 2.177.0, CODEBUDDY_API_KEY): its API-key sign-in is a session whose access
+// token is the key and whose uid is "anonymous_" and the key's last eight
+// characters (ACC_USER_ID unset), personal, with no domain and no
+// enterprise; and its model requests carry the key twice, X-API-Key and
+// Authorization: Bearer (getCustomHeaders). Its requests go to the build's
+// own host, the one its other sign-ins use: for the China build that is
+// copilot.tencent.com, the CLI's own endpoint for that build
+// (CODEBUDDY_INTERNET_ENVIRONMENT=internal, product.internal.json), and the
+// same API as www.workbuddy.cn, where the keys are made (the CLI's
+// CN_SAAS_CORE_API_FRONT_DOORS); for the international build,
+// www.workbuddy.ai (the CLI's own default, www.codebuddy.ai, is CodeBuddy's,
+// not WorkBuddy's). Nothing renews a key.
+function keyAccount(auth) {
+  const key = typeof auth?.key === "string" ? auth.key.trim() : ""
+  if (!key) return null
+  return { key, access: key, uid: "anonymous_" + key.slice(-8), source: "key" }
+}
+
+// remoteConfig says whether WorkBuddy's own CLI asks /v3/config for the
+// account's models with this key: only for keys that start ck_ or pt_
+// (shouldLoadRemoteConfig); any other key keeps the built-in list.
+const remoteConfig = (key) => /^(ck_|pt_)/.test(key)
 
 // enterpriseHeaders names the enterprise (team) an account signed in as, as
 // WorkBuddy's own client does on every request it makes for that account
@@ -324,16 +437,26 @@ function enterpriseHeaders(a) {
   return id ? { "X-Enterprise-Id": id, "X-Tenant-Id": id } : {}
 }
 
-// enterpriseOf is the enterprise the account a sign-in gave belongs to:
-// the one /login/account names, else, for an account that isn't personal,
-// the one WorkBuddy's account list has for it — the same choice WorkBuddy's
-// own client makes (mergeCurrentAccountDetails): the uid's only entry of that
-// type, or the only one it last signed in to. None found is personal.
+// enterpriseOf is the enterprise the account a sign-in gave belongs to,
+// { id, name }: the one /login/account names, else, for an account that
+// isn't personal, the one WorkBuddy's account list has for it — the same
+// choice WorkBuddy's own client makes (mergeCurrentAccountDetails): the
+// uid's only entry of that type, or the only one it last signed in to. None
+// found is personal ({ id: "" }).
+//
+// Which account that is was chosen on WorkBuddy's sign-in page: after a
+// phone sign-in it lists the person's accounts (personal, a team,
+// 「WorkBuddy 教育公益版」…) and binds the one picked to the sign-in's state
+// (POST /console/login/enterprise/<id>?state=…), so the token and
+// /login/account this plugin reads by that state are the chosen account's.
 async function enterpriseOf(site, a, who) {
+  const name = (x) => (typeof x?.enterpriseName === "string" ? x.enterpriseName.trim() : "")
   const own = typeof who?.enterpriseId === "string" ? who.enterpriseId.trim() : ""
-  if (own) return own
   const type = String(who?.type ?? "").trim().toLowerCase()
-  if (!type || type === "personal") return ""
+  if (!own && (!type || type === "personal")) return { id: "", name: "" }
+  // a name /login/account leaves out is the account list's, as the
+  // client merges the two
+  if (own && name(who)) return { id: own, name: name(who) }
   let list
   try {
     list = await call(site, "GET", "/v2/plugin/accounts", {
@@ -341,13 +464,29 @@ async function enterpriseOf(site, a, who) {
       "X-Domain": domainOf(site, a),
     })
   } catch {
-    return ""
+    return { id: own, name: "" }
   }
   const mine = (list?.accounts ?? []).filter((x) => x?.uid === who.uid && typeof x.enterpriseId === "string" && x.enterpriseId.trim())
+  if (own) return { id: own, name: name(mine.find((x) => x.enterpriseId.trim() === own)) }
   const same = mine.filter((x) => String(x.type ?? "").trim().toLowerCase() === type)
   const last = mine.filter((x) => x.lastLogin)
   const pick = same.length === 1 ? same[0] : last.length === 1 ? last[0] : mine.length === 1 ? mine[0] : undefined
-  return pick ? pick.enterpriseId.trim() : ""
+  return pick ? { id: pick.enterpriseId.trim(), name: name(pick) } : { id: "", name: "" }
+}
+
+// accountName is what magpie lists an account a sign-in gave as: the
+// person's name, and for an enterprise (team, education) account the
+// enterprise's too. One person's personal account and their enterprise one
+// share the uid and the nickname, and magpie's plugin host keeps one
+// account per name and uid (settle in host.js): named alike, signing in to
+// 「WorkBuddy 教育公益版」 took the place of the same person's personal
+// account, and the two could never be in one pool. An enterprise WorkBuddy
+// names no name for is told by the end of its id.
+function accountName(who, ent) {
+  const person = who?.nickname || who?.phoneNumber || who?.uid || ""
+  if (!ent?.id) return person
+  const team = ent.name || `enterprise ${ent.id.slice(-6)}`
+  return person ? `${person} · ${team}` : team
 }
 
 // WorkBuddy's own client names each chat to its gateway four ways: the
@@ -355,7 +494,7 @@ async function enterpriseOf(site, a, who) {
 // itself, and the request that carried it. Its backend counts a user send as
 // one request by X-Conversation-Request-ID: a chat carrying a new one every
 // time is counted on its own, so one send that takes several steps — a tool
-// call answered and sent again, a retry, another account answering — shows up
+// call answered and sent again, a retry — shows up
 // in the usage detail as many requests. The ids below are made from what
 // names the conversation and the turn, so every step of one send carries the
 // same turn id and the user's next message carries another, as WorkBuddy's
@@ -372,8 +511,28 @@ const SALT = randomBytes(16).toString("hex")
 
 // idFor is the 32 hex digits WorkBuddy's own ids are made of, made of a
 // name of the thing the id is for (a turn, a conversation) and what names it.
+// key is a string, or the pieces it is made of: the digest is the same
+// either way, and a key made of a 45 MiB message is never joined into one
+// string to be hashed (plugins#461). Each piece goes to the hash whole:
+// Bun reads a one-byte string's bytes in place, where a piece cut into
+// slices was measured costing a copy of each slice.
 function idFor(kind, key) {
-  return createHash("sha256").update(`${SALT}|${kind}|${key}`).digest("hex").slice(0, 32)
+  const h = createHash("sha256").update(`${SALT}|${kind}|`)
+  // a surrogate pair's first half ending one piece waits for the next, as
+  // the joined key would hold the pair together
+  let held = ""
+  for (let piece of typeof key === "string" ? [key] : key) {
+    if (held) piece = held + piece
+    held = ""
+    const c = piece.charCodeAt(piece.length - 1)
+    if (c >= 0xd800 && c <= 0xdbff) {
+      held = piece.slice(-1)
+      piece = piece.slice(0, -1)
+    }
+    h.update(piece)
+  }
+  if (held) h.update(held)
+  return h.digest("hex").slice(0, 32)
 }
 
 // signatureOf is a message content's signature: its text, and a digest of
@@ -382,14 +541,20 @@ function idFor(kind, key) {
 // clients of Anthropic's shape — is left out: it is not what the user said,
 // and it changes with every step of the send.
 function signatureOf(content) {
-  if (typeof content === "string") return content
-  if (!Array.isArray(content)) return ""
-  let out = ""
+  return signatureParts(content).join("")
+}
+
+// signatureParts is signatureOf in the pieces it is joined from, none empty
+function signatureParts(content) {
+  if (typeof content === "string") return content ? [content] : []
+  if (!Array.isArray(content)) return []
+  const out = []
   for (const part of content) {
     const type = part?.type ?? ""
-    if (type === "" || type === "text") out += typeof part?.text === "string" ? part.text : ""
-    else if (type !== "tool_result" && type !== "tool-result") {
-      out += `[${type}:${createHash("sha256").update(JSON.stringify(part)).digest("hex").slice(0, 8)}]`
+    if (type === "" || type === "text") {
+      if (typeof part?.text === "string" && part.text) out.push(part.text)
+    } else if (type !== "tool_result" && type !== "tool-result") {
+      out.push(`[${type}:${createHash("sha256").update(JSON.stringify(part)).digest("hex").slice(0, 8)}]`)
     }
   }
   return out
@@ -435,13 +600,18 @@ function hasBlock(m, type) {
 // has none at all: the caller then makes a fresh id for that request, as
 // before these were derived at all.
 function turnKey(chat) {
+  return turnParts(chat).join("")
+}
+
+// turnParts is turnKey in pieces (idFor takes them): [] for ""
+function turnParts(chat) {
   const msgs = Array.isArray(chat?.messages) ? chat.messages : []
   for (let i = msgs.length - 1; i >= 0; i--) {
     if (msgs[i]?.role !== "user" || answeredBefore(msgs, i)) continue
-    const sig = signatureOf(msgs[i].content)
-    return sig ? `u${i}:${sig}` : ""
+    const sig = signatureParts(msgs[i].content)
+    return sig.length ? [`u${i}:`, ...sig] : []
   }
-  return ""
+  return []
 }
 
 // conversationKey names the conversation a chat belongs to: the session
@@ -451,14 +621,19 @@ function turnKey(chat) {
 // conversation id is sent then: a made-up one would be a conversation of the
 // request's own, which is what fragments the usage detail in the first place.
 function conversationKey(chat, session) {
-  if (session) return `session:${session}`
+  return conversationParts(chat, session).join("")
+}
+
+// conversationParts is conversationKey in pieces (idFor takes them): [] for ""
+function conversationParts(chat, session) {
+  if (session) return [`session:${session}`]
   const msgs = Array.isArray(chat?.messages) ? chat.messages : []
   for (const m of msgs) {
     if (m?.role !== "user") continue
-    const sig = signatureOf(m.content)
-    if (sig) return `first:${sig}`
+    const sig = signatureParts(m.content)
+    if (sig.length) return ["first:", ...sig]
   }
-  return ""
+  return []
 }
 
 // isMessages says whether a request is an Anthropic Messages one, which
@@ -522,8 +697,13 @@ function isMessages(url, body) {
 // unsigned thinking is body itself, byte for byte.
 function withoutUnsigned(body) {
   const b = chatOf(body)
+  return unsignedOn(b) ? JSON.stringify(b) : body
+}
+
+// unsignedOn makes withoutUnsigned's change to a body's object; true when it made one
+function unsignedOn(b) {
   const msgs = b?.messages
-  if (!Array.isArray(msgs)) return body
+  if (!Array.isArray(msgs)) return false
   let changed = false
   for (const m of msgs) {
     if (m?.role !== "assistant" || !Array.isArray(m.content)) continue
@@ -532,7 +712,7 @@ function withoutUnsigned(body) {
     changed = true
     m.content = kept.length ? kept : [{ type: "text", text: "" }]
   }
-  return changed ? JSON.stringify(b) : body
+  return changed
 }
 
 // withoutSignedThinking is a Messages body without any thinking block at
@@ -557,6 +737,12 @@ function withoutSignedThinking(body) {
 
 // chatOf is a chat's body as the object it is, null for one that isn't: a
 // body that isn't text (bytes), or isn't JSON at all.
+// bodyString is a body given as bytes, as text; anything else is null.
+function bodyString(body) {
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return new TextDecoder().decode(body)
+  return null
+}
+
 function chatOf(body) {
   if (typeof body !== "string") return null
   try {
@@ -581,19 +767,64 @@ function sessionOf(headers) {
 // turn's (one user send, whatever it takes), and the conversation's. A header
 // already there — the caller's own, or another plugin's — is kept, and the
 // message and request ids are the same one, as WorkBuddy's client has them.
-function attend(headers, body, session) {
-  const chat = chatOf(body)
-  const conv = conversationKey(chat, session)
+//
+// who is the account the chat goes as (scopeOf). The ids are that account's
+// own: WorkBuddy's client runs as one account, so one conversation or turn
+// never shows up under two. Without it, one magpie session spread over a
+// group of accounts sent the same X-Conversation-ID and
+// X-Conversation-Request-ID under every account's X-User-Id.
+function attend(headers, body, session, who = "") {
+  return attendChat(headers, chatOf(body), session, who)
+}
+
+// attendChat is attend with the chat read already. It returns what reattend
+// needs to set the ids again for another account once the chat itself is
+// let go: the ids it set itself (not the caller's), and the digests of what
+// names the turn and the conversation, which are never sent as they are.
+function attendChat(headers, chat, session, who = "") {
+  const conv = conversationParts(chat, session)
+  const turn = turnParts(chat)
+  const ids = {
+    set: [],
+    // a turn is a conversation's own: two conversations whose user message
+    // reads the same are still two sends, not one
+    turn: turn.length ? idFor("turn", [...conv, "|", ...turn]) : "",
+    conv: conv.length ? idFor("conversation", conv) : "",
+  }
+  return setIds(headers, ids, who)
+}
+
+// setIds sets the message's id, and the turn's and conversation's for the
+// account who, where the caller set none.
+function setIds(headers, ids, who) {
   const msg = hex()
   headers.set("X-Conversation-Message-ID", msg)
   headers.set("X-Request-ID", msg)
+  const set = []
+  const own = (kind, base) => (who ? idFor(kind, [`account:${who}`, "|", base]) : base)
   if (!headers.has("X-Conversation-Request-ID")) {
-    const turn = turnKey(chat)
-    // a turn is a conversation's own: two conversations whose user message
-    // reads the same are still two sends, not one
-    headers.set("X-Conversation-Request-ID", turn ? idFor("turn", `${conv}|${turn}`) : hex())
+    headers.set("X-Conversation-Request-ID", ids.turn ? own("turn", ids.turn) : hex())
+    set.push("X-Conversation-Request-ID")
   }
-  if (conv && !headers.has("X-Conversation-ID")) headers.set("X-Conversation-ID", idFor("conversation", conv))
+  if (ids.conv && !headers.has("X-Conversation-ID")) {
+    headers.set("X-Conversation-ID", own("conversation", ids.conv))
+    set.push("X-Conversation-ID")
+  }
+  return { ...ids, set }
+}
+
+// scopeOf names the account a chat goes as for attend: its uid, its
+// enterprise, and for a key account the key (only ever hashed).
+function scopeOf(a) {
+  return `${a?.uid ?? ""}|${a?.enterpriseId ?? ""}|${a?.source === "key" ? a.key ?? "" : ""}`
+}
+
+// reattend sets a chat's ids again for the account it is now sent as, when
+// that is another account than the one they were set for.
+function reattend(headers, ids, was, now) {
+  if (was === now) return ids
+  for (const h of ids.set) headers.delete(h)
+  return setIds(headers, ids, now)
 }
 
 // FLAGGED are the words WorkBuddy refuses a chat for, "Illegal API
@@ -610,8 +841,14 @@ const FLAGGED = [
   [/(?<!the )Codex CLI is an open source project led by OpenAI\./gi, "The Codex CLI is an open source project led by OpenAI."],
   // DeepSeek Harness (DSH) opens its system prompt with this line, which
   // WorkBuddy refuses as 11128 (magpie-community/plugins#279; the same
-  // refusal traced in smart-open/TraeWorkAssistant#125).
-  [/You are an AI agent powered by DeepSeek Harness\.?/gi, "You are an AI agent that helps the user with programming tasks."],
+  // refusal traced in smart-open/TraeWorkAssistant#125). WorkBuddy matches
+  // the line whole and exactly, so a comma is enough to pass: measured on
+  // 2026-10-30 against copilot.tencent.com, one account, streamed, the line
+  // as DSH writes it answered 400 code 11128 and the same line with the
+  // comma answered 200. Saying it in another agent's terms passed too, but
+  // took the harness's own name out of the only line that says which agent
+  // runs here, and that name is what the rest of the prompt refers back to.
+  [/You are an AI agent powered by DeepSeek Harness\.?/gi, "You are an AI agent, powered by DeepSeek Harness."],
   // A line WorkBuddy refuses in a long DeepSeek Harness chat, measured 400
   // then 200 with this wording by tearslee (magpie-community/plugins#291). The
   // model can quote it back into an assistant message, which the move to
@@ -664,32 +901,68 @@ function unflag(messages) {
 // OpenAI-compatible client normally uses max_completion_tokens and may call a
 // reasoning prompt developer; WorkBuddy's endpoint takes max_tokens and
 // system instead.
+// An earlier turn's thinking goes back as `reasoning`, the field WorkBuddy's
+// own client (CodeBuddy's agents converter) sets on an assistant message.
+// WorkBuddy drops `reasoning_content`, which Grok Build, DeepSeek-style
+// clients and magpie's own replies use: measured 2026-10-27 on
+// www.workbuddy.ai, a codeword in reasoning_content reached none of
+// kimi-k2.6, kimi-k3, glm-5.3, deepseek-v4.1-flash and minimax-m3, while
+// the same words as `reasoning` reached kimi-k2.6 and minimax-m3.
+// OpenRouter-style reasoning_details are read for their text the same way.
+function reasoningOf(m) {
+  if (typeof m.reasoning_content === "string" && m.reasoning_content) return m.reasoning_content
+  if (Array.isArray(m.reasoning_details)) {
+    const text = m.reasoning_details.map((d) => (typeof d?.text === "string" ? d.text : typeof d?.summary === "string" ? d.summary : "")).join("")
+    if (text) return text
+  }
+  return ""
+}
+
+function asReasoning(messages) {
+  let changed = false
+  for (const m of messages) {
+    if (m?.role !== "assistant" || (m.reasoning_content === undefined && m.reasoning_details === undefined)) continue
+    const text = reasoningOf(m)
+    if (text && !(typeof m.reasoning === "string" && m.reasoning)) m.reasoning = text
+    delete m.reasoning_content
+    delete m.reasoning_details
+    changed = true
+  }
+  return changed
+}
+
 function withSystem(body) {
   // a body magpie or OpenCode hands over as bytes is read as the text it is
   if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) body = new TextDecoder().decode(body)
   if (typeof body !== "string") return body
   try {
     const b = JSON.parse(body)
-    if (!Array.isArray(b?.messages) || !b.messages.length) return body
-    let changed = unflag(b.messages)
-    if (b.max_completion_tokens !== undefined) {
-      if (b.max_tokens === undefined) b.max_tokens = b.max_completion_tokens
-      delete b.max_completion_tokens
-      changed = true
-    }
-    for (const m of b.messages) {
-      if (m?.role !== "developer") continue
-      m.role = "system"
-      changed = true
-    }
-    if (b.messages[0]?.role !== "system") {
-      b.messages.unshift({ role: "system", content: "You are a helpful assistant." })
-      changed = true
-    }
-    return changed ? JSON.stringify(b) : body
+    return systemOn(b) ? JSON.stringify(b) : body
   } catch {
     return body
   }
+}
+
+// systemOn makes withSystem's changes to a chat's object; true when it made any
+function systemOn(b) {
+  if (!Array.isArray(b?.messages) || !b.messages.length) return false
+  let changed = unflag(b.messages)
+  if (b.max_completion_tokens !== undefined) {
+    if (b.max_tokens === undefined) b.max_tokens = b.max_completion_tokens
+    delete b.max_completion_tokens
+    changed = true
+  }
+  for (const m of b.messages) {
+    if (m?.role !== "developer") continue
+    m.role = "system"
+    changed = true
+  }
+  if (asReasoning(b.messages)) changed = true
+  if (b.messages[0]?.role !== "system") {
+    b.messages.unshift({ role: "system", content: "You are a helpful assistant." })
+    changed = true
+  }
+  return changed
 }
 
 // WorkBuddy's channel check reads the system and assistant messages only:
@@ -718,7 +991,11 @@ function textOf(content) {
 // systemKey is the text of a chat's system messages, which a chat refused
 // once is known by: the same agent's next chat goes with systemAsUser at once
 function systemKey(body) {
-  const msgs = chatOf(body)?.messages
+  return systemKeyOf(chatOf(body))
+}
+
+function systemKeyOf(chat) {
+  const msgs = chat?.messages
   if (!Array.isArray(msgs)) return ""
   const key = msgs.filter((m) => m?.role === "system").map((m) => textOf(m.content)).join("\n")
   return key.trim() === DEFAULT_SYSTEM ? "" : key
@@ -726,15 +1003,21 @@ function systemKey(body) {
 
 function systemAsUser(body) {
   const b = chatOf(body)
+  return systemAsUserOn(b) ? JSON.stringify(b) : null
+}
+
+// systemAsUserOn makes systemAsUser's move on a chat's object; false when
+// there's nothing to move
+function systemAsUserOn(b) {
   const msgs = b?.messages
-  if (!Array.isArray(msgs)) return null
+  if (!Array.isArray(msgs)) return false
   let i = 0
   const lead = []
   for (; i < msgs.length && msgs[i]?.role === "system"; i++) lead.push(textOf(msgs[i].content))
   const said = lead.join("\n\n").trim()
   const rest = msgs.slice(i).map((m) => (m?.role === "system" ? { ...m, role: "user" } : m))
   const moved = said && said !== DEFAULT_SYSTEM
-  if (!moved && rest.every((m, k) => m === msgs[i + k])) return null
+  if (!moved && rest.every((m, k) => m === msgs[i + k])) return false
   if (moved) {
     const text = INSTRUCTIONS[0] + said + INSTRUCTIONS[1]
     const u = rest.findIndex((m) => m?.role === "user")
@@ -744,7 +1027,80 @@ function systemAsUser(body) {
     else rest[u] = { ...rest[u], content: text }
   }
   b.messages = [{ role: "system", content: DEFAULT_SYSTEM }, ...rest]
-  return JSON.stringify(b)
+  return true
+}
+
+// OPENERS are the shapes in which an agent's opening says which harness it
+// runs in, as a vendor may have fingerprinted one. A vendor matches a refused
+// line whole and exactly — one extra space passes it, as FLAGGED's note above
+// has it — so the same line with one more comma passes while still saying
+// what it said. Measured 2026-10-30 against copilot.tencent.com, one account,
+// streamed, deepseek-v4.1-flash at max: DeepSeek Harness's opener answered
+// 400 code 11128 as written, and 200 with the comma, the harness's name still
+// in it; a suffix in its place (…Harness Desktop., …Harness CLI.) changed
+// nothing, so it is the line's shape the vendor knows, not the product alone.
+const OPENERS = [
+  [/(\bYou are (?:an?|the)\s[^\n.,]{0,60}?\b(?:agent|assistant))\s+(powered by|running on|running in|built on|based on)\b/gi, "$1, $2"],
+]
+
+function opened(text) {
+  for (const [re, to] of OPENERS) text = text.replace(re, to)
+  return text
+}
+
+// commaPaused is body with OPENERS' comma set in its system and assistant
+// messages — the two WorkBuddy reads (REFUSED.md). The user's messages and
+// tools' results are not among them: a comma in a message the vendor never
+// matches changes what someone said without changing what was refused, and
+// the user's own words come back altered. It is tried before systemAsUser,
+// which takes the system prompt out of the slot an agent's instructions are
+// read in. null when there was nothing to set a comma in.
+//
+// The two roles are read off the message's own role: a message with no role,
+// or one of another kind, is left as it is. roles, when given, collects the
+// roles the comma went into — the caller uses it to tell a comma that made a
+// chat pass in its system prompt from one that only set an assistant
+// message's (commaSystems).
+const PAUSED_ROLES = new Set(["system", "assistant"])
+
+function commaPaused(body, roles) {
+  const b = chatOf(body)
+  return commaPausedOn(b, roles) ? JSON.stringify(b) : null
+}
+
+// commaPausedOn makes commaPaused's change on a chat's object, in place; false
+// when there was nothing to set a comma in. commaPaused is this on a body, and
+// the first send of a system prompt whose comma passed is this too
+// (commaSystems), so the two can never drift apart.
+function commaPausedOn(b, roles) {
+  const msgs = b?.messages
+  if (!Array.isArray(msgs)) return false
+  let changed = false
+  for (const m of msgs) {
+    if (!PAUSED_ROLES.has(m?.role)) continue
+    let mine = false
+    if (typeof m.content === "string") {
+      const t = opened(m.content)
+      if (t !== m.content) {
+        m.content = t
+        mine = true
+      }
+    } else if (Array.isArray(m.content)) {
+      for (const p of m.content) {
+        if (typeof p?.text !== "string") continue
+        const t = opened(p.text)
+        if (t === p.text) continue
+        p.text = t
+        mine = true
+      }
+    }
+    // a message whose parts held no opening of their own is not changed, and
+    // is not reported as one that was
+    if (!mine) continue
+    changed = true
+    roles?.add(m.role)
+  }
+  return changed
 }
 
 // normalizeToolChoice converts the object form emitted by OpenAI clients to
@@ -754,40 +1110,45 @@ function normalizeToolChoice(body) {
   if (typeof body !== "string") return body
   try {
     const b = JSON.parse(body)
-    if (!b || typeof b !== "object" || Array.isArray(b) || !("tool_choice" in b)) return body
-    const choice = b.tool_choice
-    if (typeof choice === "string") {
-      if (choice.trim().toLowerCase() === "none") {
-        delete b.tool_choice
-        delete b.tools
-        delete b.functions
-      }
-      return JSON.stringify(b)
-    }
-    if (!choice || typeof choice !== "object" || Array.isArray(choice)) {
-      delete b.tool_choice
-      return JSON.stringify(b)
-    }
-    const type = typeof choice.type === "string" ? choice.type.trim().toLowerCase() : ""
-    if (type === "none") {
-      delete b.tool_choice
-      delete b.tools
-      delete b.functions
-    } else if (type === "auto" || type === "required") {
-      b.tool_choice = type
-    } else if (type === "function") {
-      const fn = choice.function && typeof choice.function === "object" && !Array.isArray(choice.function)
-        ? choice.function
-        : undefined
-      const name = typeof fn?.name === "string" ? fn.name.trim() : ""
-      b.tool_choice = name || "auto"
-    } else {
-      delete b.tool_choice
-    }
-    return JSON.stringify(b)
+    return toolChoiceOn(b) ? JSON.stringify(b) : body
   } catch {
     return body
   }
+}
+
+// toolChoiceOn makes normalizeToolChoice's change to a chat's object; true
+// when it made one (a string choice other than none is WorkBuddy's already)
+function toolChoiceOn(b) {
+  if (!b || typeof b !== "object" || Array.isArray(b) || !("tool_choice" in b)) return false
+  const choice = b.tool_choice
+  if (typeof choice === "string") {
+    if (choice.trim().toLowerCase() !== "none") return false
+    delete b.tool_choice
+    delete b.tools
+    delete b.functions
+    return true
+  }
+  if (!choice || typeof choice !== "object" || Array.isArray(choice)) {
+    delete b.tool_choice
+    return true
+  }
+  const type = typeof choice.type === "string" ? choice.type.trim().toLowerCase() : ""
+  if (type === "none") {
+    delete b.tool_choice
+    delete b.tools
+    delete b.functions
+  } else if (type === "auto" || type === "required") {
+    b.tool_choice = type
+  } else if (type === "function") {
+    const fn = choice.function && typeof choice.function === "object" && !Array.isArray(choice.function)
+      ? choice.function
+      : undefined
+    const name = typeof fn?.name === "string" ? fn.name.trim() : ""
+    b.tool_choice = name || "auto"
+  } else {
+    delete b.tool_choice
+  }
+  return true
 }
 
 // ---- tools WorkBuddy takes ----------------------------------------------------
@@ -1138,6 +1499,62 @@ function fitted(body) {
   }
 }
 
+// gzipped is a chat's body compressed, as WorkBuddy's own client sends its
+// model requests: its CLI's GzipRequestProcessor (WorkBuddy 5.9.3, CLI
+// 2.165.0, on both builds) gzips each POST's body and sets
+// Content-Encoding: gzip when the product's RequestBodyGzip feature is on,
+// which both builds' product.json turn on and /v3/config (merged over it)
+// doesn't turn off. Sent as plain JSON, a long agent conversation went up
+// whole on every step: runmiNeverstop on X saw 2.89 GB up to
+// copilot.tencent.com against 258 MB down. Measured 2026-10-28 on
+// www.workbuddy.ai: a gzipped chat answers as the plain one does. A
+// Messages request (Claude on the China build) goes as it came: that route
+// wasn't tried gzipped. Only a chat completion goes gzipped (isCompletion):
+// WorkBuddy's images API reads its body as plain JSON, and magpie's drawing
+// (/v2/images/generations, /v2/images/edits) is sent through this same
+// fetch; gzipped it answered 400 11101 "invalid character '\x1f'" (iwinux on
+// Discord, 0.1.43). null when the body isn't sent gzipped.
+function gzipped(completion, b) {
+  if (!completion) return null
+  if (typeof b === "string") return gzipSync(Buffer.from(b))
+  if (b instanceof ArrayBuffer || ArrayBuffer.isView(b)) return gzipSync(b)
+  return null
+}
+
+// prepared is a request's body read once for every change the loader makes
+// to it and everything it reads off it (plugins#461): a long chat, 45 MiB
+// of history, was parsed six times on its way, once by each step, and
+// written out again whole by normalizeToolChoice even when nothing changed.
+// chat is the parsed body, changed whether any step changed it; the caller
+// writes it out once, when it did. Each step is the one its own function
+// above makes, in the same order.
+function prepared(body, native) {
+  if (!native && (body instanceof ArrayBuffer || ArrayBuffer.isView(body))) body = new TextDecoder().decode(body)
+  const none = { body, chat: null, names: new Map(), changed: false }
+  if (typeof body !== "string") return none
+  let chat
+  try {
+    chat = JSON.parse(body)
+  } catch {
+    return none
+  }
+  if (chat === null || typeof chat !== "object") return none
+  if (native) return { body, chat, names: new Map(), changed: unsignedOn(chat) }
+  try {
+    let changed = systemOn(chat)
+    const fit = fitTools(chat)
+    if (fit.changed) changed = true
+    if (toolChoiceOn(chat)) changed = true
+    return { body, chat, names: fit.names, changed }
+  } catch {
+    // a shape a step can't take: the steps one by one, each keeping the
+    // body as it was when it can't, as they always have
+    const fit = fitted(withSystem(body))
+    const out = normalizeToolChoice(fit.body)
+    return { body: out, chat: chatOf(out), names: fit.names, changed: false }
+  }
+}
+
 // namedBack gives the model's calls in a chat answer (one JSON body, or an
 // SSE stream's chunks) the names the client gave its tools.
 function namedBack(v, names) {
@@ -1204,6 +1621,113 @@ function renamed(res, names) {
   return new Response(body, { status: res.status, statusText: res.statusText, headers })
 }
 
+// FILTER_SAYS is the text WorkBuddy's safety filter puts in a reply it ends
+// with finish_reason "content_filter": deepseek-v4.1-flash on
+// copilot.tencent.com reasoned, said this, and ended content_filter with
+// no output tokens counted (itspig, plugins #540).
+const FILTER_SAYS = ["Sorry, I can't respond to this question."]
+
+// filterSaid tells whether text said so far may still be FILTER_SAYS, with
+// white space on either side: copilot.tencent.com sends it as
+// "\nSorry, I can't respond to this question.\n" (itspig, plugins #540).
+// Text that is only white space so far may still be it; text that goes on
+// past it is not.
+const filterSaid = (text) => {
+  const t = text.replace(/’/g, "'").trim()
+  return FILTER_SAYS.some((s) => s.startsWith(t))
+}
+
+// unsaid is a streamed chat whose reply WorkBuddy's filter refused with its
+// text (FILTER_SAYS) and finish_reason content_filter, with the text taken
+// out: a reply that says nothing before content_filter is the refusal magpie
+// asks the group's next member for, where a 200 that said something is an
+// answer the agent fails on ("The model refused to complete the request",
+// plugins #540). Only text that is still the filter's is held, so any other
+// reply's first words go as they come, and one that only begins like it is
+// let through at its first word that isn't, or at its end.
+function unsaid(res) {
+  if (!res.body || !/event-stream/i.test(res.headers.get("content-type") ?? "")) return res
+  const headers = new Headers(res.headers)
+  headers.delete("content-length")
+  headers.delete("content-encoding")
+  const dec = new TextDecoder()
+  const enc = new TextEncoder()
+  let rest = ""
+  let open = true // the reply may still be the filter's
+  let said = ""
+  let held = [] // events held while it may be
+  const chunkOf = (ev) => {
+    const m = /^data:\s?(.*)$/m.exec(ev)
+    if (!m || m[1] === "[DONE]") return null
+    try {
+      const v = JSON.parse(m[1])
+      return v && typeof v === "object" ? v : null
+    } catch {
+      return null
+    }
+  }
+  // without is ev with the filter's text taken out, or "" when nothing
+  // else is in it
+  const without = (ev) => {
+    const v = chunkOf(ev)
+    const c = v?.choices?.[0]
+    if (!c?.delta || typeof c.delta.content !== "string") return ev
+    delete c.delta.content
+    const left = Object.keys(c.delta).filter((k) => k !== "role")
+    if (!left.length && c.finish_reason == null && v.usage == null) return ""
+    return `data: ${JSON.stringify(v)}`
+  }
+  const event = (ev) => {
+    if (!open) return [ev]
+    const c = chunkOf(ev)?.choices?.[0]
+    const text = typeof c?.delta?.content === "string" ? c.delta.content : ""
+    const finish = c?.finish_reason
+    // copilot.tencent.com sends "tool_calls": [] on every delta, text
+    // too: only a list with a call in it is one
+    const calls = c?.delta?.tool_calls
+    if ((Array.isArray(calls) ? calls.length > 0 : calls) || (text && !filterSaid(said + text))) {
+      open = false
+      const out = [...held, ev]
+      held = []
+      return out
+    }
+    said += text
+    if (finish === "content_filter" && said) {
+      open = false
+      const out = [...held, ev].map(without).filter(Boolean)
+      held = []
+      return out
+    }
+    if (finish) {
+      open = false
+      const out = [...held, ev]
+      held = []
+      return out
+    }
+    if (!said) return [ev] // reasoning, the role, before any text
+    held.push(ev)
+    return []
+  }
+  const body = res.body.pipeThrough(
+    new TransformStream({
+      transform(chunk, ctl) {
+        rest = (rest + dec.decode(chunk, { stream: true })).replace(/\r\n/g, "\n")
+        const evs = rest.split("\n\n")
+        rest = evs.pop()
+        const out = evs.flatMap(event)
+        if (out.length) ctl.enqueue(enc.encode(out.map((e) => e + "\n\n").join("")))
+      },
+      flush(ctl) {
+        rest += dec.decode()
+        const out = held.map((e) => e + "\n\n").join("") + rest
+        held = []
+        if (out) ctl.enqueue(enc.encode(out))
+      },
+    }),
+  )
+  return new Response(body, { status: res.status, statusText: res.statusText, headers })
+}
+
 // ---- signing in -------------------------------------------------------------
 
 // poll asks path until WorkBuddy answers with data, retrying the codes
@@ -1251,8 +1775,9 @@ async function browserSignIn(site) {
           "X-No-Enterprise-Id": "true",
         }, [12151], deadline)
         a.uid = who.uid ?? ""
-        a.enterpriseId = await enterpriseOf(site, a, who)
-        return success(site, a, who.nickname || who.phoneNumber || who.uid)
+        const ent = await enterpriseOf(site, a, who)
+        a.enterpriseId = ent.id
+        return success(site, a, accountName(who, ent))
       } catch (e) {
         return { type: "failed", error: e.message }
       }
@@ -1272,6 +1797,57 @@ function success(site, a, name) {
     ...(a.enterpriseId ? { enterpriseId: a.enterpriseId } : {}),
     ...(a.refreshExpiresAt ? { refreshExpiresAt: a.refreshExpiresAt } : {}),
     ...(a.tokenType ? { tokenType: a.tokenType } : {}),
+  }
+}
+
+// parseImport reads a pasted WorkBuddy sign-in JSON into the token shape the
+// rest of the plugin uses. It accepts WorkBuddy desktop's ".info" file as a
+// whole ({ account, auth }), or a flat token object ({ accessToken, ... }).
+// Unlike readDesktop it does NOT mark the result source:"desktop": the
+// imported sign-in is stored and renewed like a browser sign-in, so its
+// refresh token is this account's (import it on one machine at a time).
+function parseImport(text) {
+  const f = JSON.parse(text)
+  const t = f?.auth && typeof f.auth === "object" ? f.auth : f
+  const acct = f?.account && typeof f.account === "object" ? f.account : f
+  if (t?.accessToken?.$wbEncrypted || t?.refreshToken?.$wbEncrypted)
+    throw new Error("这是 WorkBuddy 5.6+ 的加密登录，magpie 读不了；请在 WorkBuddy 里退出重登后再导出，或用浏览器登录")
+  if (typeof t?.accessToken !== "string" || !t.accessToken) return null
+  const now = Date.now()
+  const uid = acct?.uid ?? t.uid
+  if (!uid) return null
+  const ent = acct?.enterpriseId ?? t.enterpriseId
+  return {
+    access: t.accessToken,
+    refresh: typeof t.refreshToken === "string" ? t.refreshToken : "",
+    expires: t.expiresAt > 0 ? t.expiresAt : t.expiresIn > 0 ? now + t.expiresIn * 1000 : 0,
+    refreshExpiresAt: t.refreshExpiresAt > 0 ? t.refreshExpiresAt : t.refreshExpiresIn > 0 ? now + t.refreshExpiresIn * 1000 : 0,
+    domain: typeof t.domain === "string" ? t.domain : "",
+    tokenType: typeof t.tokenType === "string" ? t.tokenType : "",
+    uid,
+    ...(typeof ent === "string" && ent.trim() ? { enterpriseId: ent.trim() } : {}),
+    name: acct?.nickname || acct?.phoneNumber || uid,
+  }
+}
+
+// importSignIn is an added sign-in method: the user pastes WorkBuddy's sign-in
+// JSON (its desktop ".info" file, { account, auth }) and the plugin stores it
+// as a normal, refreshable oauth sign-in. For a machine where WorkBuddy
+// desktop isn't installed, or to carry a sign-in between machines.
+function importSignIn(site) {
+  return {
+    url: "",
+    instructions: `粘贴 ${site.name} 的登录 JSON（WorkBuddy 桌面端 auth 的 .info 文件内容，含 account 与 auth），回车确认。`,
+    method: "code",
+    async callback(text) {
+      try {
+        const a = parseImport((text ?? "").trim())
+        if (!a) return { type: "failed", error: "登录 JSON 里没有可用的 accessToken / uid" }
+        return success(site, a, a.name)
+      } catch (e) {
+        return { type: "failed", error: "登录 JSON 解析失败：" + (e?.message ?? String(e)) }
+      }
+    },
   }
 }
 
@@ -1342,57 +1918,6 @@ function desktopSignIn(site) {
   }
 }
 
-// parseImport reads a pasted WorkBuddy sign-in JSON into the token shape the
-// rest of the plugin uses. It accepts WorkBuddy desktop's ".info" file as a
-// whole ({ account, auth }), or a flat token object ({ accessToken, ... }).
-// Unlike readDesktop it does NOT mark the result source:"desktop": the
-// imported sign-in is stored and renewed like a browser sign-in, so its
-// refresh token is this account's (import it on one machine at a time).
-function parseImport(text) {
-  const f = JSON.parse(text)
-  const t = f?.auth && typeof f.auth === "object" ? f.auth : f
-  const acct = f?.account && typeof f.account === "object" ? f.account : f
-  if (t?.accessToken?.$wbEncrypted || t?.refreshToken?.$wbEncrypted)
-    throw new Error("这是 WorkBuddy 5.6+ 的加密登录，magpie 读不了；请在 WorkBuddy 里退出重登后再导出，或用浏览器登录")
-  if (typeof t?.accessToken !== "string" || !t.accessToken) return null
-  const now = Date.now()
-  const uid = acct?.uid ?? t.uid
-  if (!uid) return null
-  const ent = acct?.enterpriseId ?? t.enterpriseId
-  return {
-    access: t.accessToken,
-    refresh: typeof t.refreshToken === "string" ? t.refreshToken : "",
-    expires: t.expiresAt > 0 ? t.expiresAt : t.expiresIn > 0 ? now + t.expiresIn * 1000 : 0,
-    refreshExpiresAt: t.refreshExpiresAt > 0 ? t.refreshExpiresAt : t.refreshExpiresIn > 0 ? now + t.refreshExpiresIn * 1000 : 0,
-    domain: typeof t.domain === "string" ? t.domain : "",
-    tokenType: typeof t.tokenType === "string" ? t.tokenType : "",
-    uid,
-    ...(typeof ent === "string" && ent.trim() ? { enterpriseId: ent.trim() } : {}),
-    name: acct?.nickname || acct?.phoneNumber || uid,
-  }
-}
-
-// importSignIn is a third sign-in method: the user pastes WorkBuddy's sign-in
-// JSON (its desktop ".info" file, { account, auth }) and the plugin stores it
-// as a normal, refreshable oauth sign-in. For a machine where WorkBuddy
-// desktop isn't installed, or to carry a sign-in between machines.
-function importSignIn(site) {
-  return {
-    url: "",
-    instructions: `粘贴 ${site.name} 的登录 JSON（WorkBuddy 桌面端 auth 的 .info 文件内容，含 account 与 auth），回车确认。`,
-    method: "code",
-    async callback(text) {
-      try {
-        const a = parseImport((text ?? "").trim())
-        if (!a) return { type: "failed", error: "登录 JSON 里没有可用的 accessToken / uid" }
-        return success(site, a, a.name)
-      } catch (e) {
-        return { type: "failed", error: "登录 JSON 解析失败：" + (e?.message ?? String(e)) }
-      }
-    },
-  }
-}
-
 // desktopHeld is what a desktop sign-in was renewed to here, by site and
 // account: kept in memory only, never written where the app keeps it.
 const desktopHeld = new Map()
@@ -1438,7 +1963,7 @@ const statusText = (n) => STATUS_TEXT[n] || `HTTP ${n}`
 function meterAsked(site, a, path, body = {}, signal = AbortSignal.timeout(20000)) {
   return fetch(site.endpoint + path, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": "WorkBuddy/" + UA_VERSION,
+    headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": "WorkBuddy/" + site.app,
       Authorization: "Bearer " + a.access, "X-User-Id": a.uid ?? "", "X-Domain": domainOf(site, a), "X-Product": "SaaS",
       "X-IDE-Type": "WorkBuddy", ...enterpriseHeaders(a) },
     body: JSON.stringify(body),
@@ -1470,6 +1995,8 @@ async function unanswered(site, a, body, err, signal) {
   if (signal?.aborted || err?.name === "AbortError" || err?.name === "TimeoutError") throw err
   const size = byteLength(body)
   if (size <= EDGE_READS) throw err
+  // the billing API isn't asked with a key: what it answers one is unknown
+  if (a.source === "key") throw err
   let status = 0
   let challenge = ""
   try {
@@ -1597,6 +2124,18 @@ function refusedText(site, a, why, note) {
   )
 }
 
+// keyRefused is the answer to a request WorkBuddy refused an API key for
+// (401): a key isn't renewed, so it says to check the key. Marked expired
+// only on WorkBuddy's word that the token itself is refused (invalidToken).
+function keyRefused(site, expired, note) {
+  const message = `${site.name} refused this API key (401). ${note ? note + " " : ""}Check the key at ${site.keys}, then add it again in magpie: Providers → ${site.name}.`
+  return new Response(JSON.stringify({ error: { message, type: "authentication_error", code: 401 } }), {
+    status: 401,
+    statusText: "Unauthorized",
+    headers: { "content-type": "application/json", "X-Magpie-Sign-In": expired ? "expired" : "kept" },
+  })
+}
+
 // signedOut is the answer to a request WorkBuddy refused this account's
 // sign-in for, renewed or not: a 401 that says so and what to do, which
 // WorkBuddy's own (an HTML page, its {code, msg}) doesn't. expired marks
@@ -1615,21 +2154,97 @@ function signedOut(site, a, why, expired, note) {
 // the same: WorkBuddy's message, else its code, else the HTTP status.
 async function meter(site, a, path, body = {}) {
   const res = await meterAsked(site, a, path, body)
+  const raw = await res.text()
   let env = {}
+  let parsed = true
   try {
-    env = JSON.parse(await res.text()) ?? {}
-  } catch {}
-  const code = Number.parseInt(env.code, 10) || 0
-  if (!res.ok) {
-    // the status and whether the token itself was refused go with it, for
-    // usage's one renewal on a 401 (reissued)
-    const said = { status: res.status, invalidToken: invalidToken(res) }
-    if (code) throw Object.assign(new Error(env.msg || `error ${code}`), said)
-    if (env.msg) throw Object.assign(new Error(env.msg), said)
-    throw Object.assign(new Error(statusText(res.status)), said)
+    env = JSON.parse(raw) ?? {}
+  } catch {
+    parsed = false
   }
-  if (code) throw new Error(env.msg || `error ${code}`)
+  if (res.ok && !parsed) {
+    const unreadable = raw.trim().slice(0, 120) || "(empty)"
+    throw Object.assign(new Error(`unreadable reply ${unreadable}`), { status: res.status, code: 0, unreadable: true })
+  }
+  const code = Number.parseInt(env.code, 10) || 0
+  // the status, the code and whether the token itself was refused go with
+  // it, for usage's one renewal on a 401 (reissued) and check-in's outcomes
+  const said = { status: res.status, code }
+  if (!res.ok) said.invalidToken = invalidToken(res)
+  const err = (message) => Object.assign(new Error(message), said)
+  if (!res.ok) {
+    if (code) throw err(env.msg || `error ${code}`)
+    if (env.msg) throw err(env.msg)
+    throw err(statusText(res.status))
+  }
+  if (code) throw err(env.msg || `error ${code}`)
   return env.data ?? null
+}
+
+// checkinOf claims the account's daily credits. China has the /v2 meter;
+// after the activity status names an active, unchecked day. Transient
+// upstream failures are asked again twice (the bounded retry quota-hub
+// observed on the billing endpoint; callers may shorten the waits for a
+// test).
+async function checkinOf(site, a, { waits = [0, 0] } = {}) {
+  let status
+  try {
+    status = await meter(site, a, "/v2/billing/meter/checkin-activity-status")
+  } catch (e) {
+    if (e?.code === 1001) return { outcome: "done" }
+    // a reply WorkBuddy sent is the day's failed answer; only a request
+    // that got no answer leaves as a throw, for magpie's offline backoff
+    if (e?.status !== undefined || e?.code !== undefined) return { outcome: "failed", message: e.message }
+    throw e
+  }
+  if (!status?.active) return { outcome: "inactive" }
+  if (status.today_checked_in ?? status.todayCheckedIn) {
+    // today_credit is what today actually gave, the built-in's word for a
+    // day already in; daily_credit is the day's grant
+    const credit = Number(status.today_credit ?? status.daily_credit)
+    return { outcome: "done", ...(Number.isFinite(credit) && credit > 0 ? { credit } : {}) }
+  }
+  const paths = ["/v2/billing/meter/daily-checkin"]
+  for (let attempt = 0; ; attempt++) {
+    let i = 0
+    while (i < paths.length) {
+      try {
+        const got = await meter(site, a, paths[i++])
+        // the claim's own answer, as the built-in hands it on: the credit
+        // and streak it granted and what it said, for the card
+        const credit = Number(got?.credit)
+        const streak = Number(got?.streak_days)
+        return {
+          outcome: "claimed",
+          ...(Number.isFinite(credit) && credit > 0 ? { credit } : {}),
+          ...(Number.isFinite(streak) && streak > 0 ? { streak } : {}),
+          ...(got?.message ? { message: String(got.message) } : {}),
+        }
+      } catch (e) {
+        if (e?.code === 1001) return { outcome: "done" }
+        if (e?.code === 1002) return { outcome: "ineligible", message: e.message }
+        if (e?.code === 1003) return { outcome: "inactive", message: e.message }
+        if (e?.status === 401) {
+          try {
+            await meter(site, a, "/billing/meter/get-user-resource-summary")
+          } catch {
+            throw e
+          }
+          return { outcome: "ineligible", message: "WorkBuddy's check-in takes WorkBuddy's own app" }
+        }
+        if (e?.unreadable) return { outcome: "failed", message: `check-in: ${e.message}` }
+        const transient = e?.status >= 500 || e?.code === 10000
+        if (transient && attempt < waits.length) {
+          await new Promise((r) => setTimeout(r, waits[attempt]))
+          break
+        }
+        // a reply WorkBuddy sent is the day's failed answer; only a request
+        // that got no answer leaves as a throw, for magpie's offline backoff
+        if (e?.status !== undefined || e?.code !== undefined) return { outcome: "failed", message: e.message }
+        throw e
+      }
+    }
+  }
 }
 
 // capacity is a capacity the billing API sends, as a string ("438.88")
@@ -1646,21 +2261,781 @@ function capacity(v) {
 // compact is a count as magpie says one: whole, else to two places.
 const compact = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""))
 
+// The window WorkBuddy rate limits deepseek-v4.1-flash by, which its credit
+// meter does not show: WorkBuddy AI measured at about 1e8 over ten days, the
+// China build at about 2e8 on 2026-11-02 (see CN_ESTIMATED_WINDOWS).
+//
+// A free account's usage() reports only the credits window, so a plan with
+// 160 credits untouched reads 0% while chats to deepseek-v4.1-flash are
+// already refused: the model has a token allowance of its own, counted
+// apart from credits, and nothing the vendor answers with reports it. The
+// refusal is the only place it appears, and only as a time:
+//
+//   429 usage exceeds frequency limit, but don't worry, your usage will
+//   reset at 2026-10-20 19:47:41 UTC+8, alternatively, you can switch to
+//   the other models to continue using it.
+//
+// The China build (copilot.tencent.com) says the same in its own words:
+//
+//   429 WorkBuddy: 您的使用量已超出频率限制，将在 2026-11-02 19:17:02
+//   UTC+8 重置，您也可以切换其他模型继续使用。
+//
+// Measured on a free plan over ten days (one account, deepseek-v4.1-flash
+// only), counting in + cache_read + out:
+//
+//   10-15 15:40 → 100,183,315  429      10-18 19:52 →  92,792,962  429
+//   10-16 16:48 →  99,971,831  429      10-19 19:47 →  98,201,537  429
+//   10-14 15:38 →  71,687,717  lapsed
+//
+// so the cap is per account per 24 hours at about 1e8 tokens, the largest
+// value that still answered being 100,183,315. Three things about it are
+// easy to get wrong and were all checked:
+//
+//   - cache_read counts. In + out alone is 20× smaller (0.75M–3.9M a
+//     window) and never comes near the cap.
+//   - the window is fixed, not sliding: peak trailing-24h over the same
+//     data is 172.85M, which a sliding window would have held to 1e8.
+//   - the reset a refusal names is the window's start + 24h exactly, and
+//     the start is the first request answered after the previous window
+//     ended — not the reset instant. Gaps of 6, 68, 80 and 182 minutes
+//     were seen between a reset and the next request, each opening the new
+//     window.
+//
+// The China build was measured after that, on 2026-11-02: two Free-plan
+// accounts on copilot.tencent.com, both spending the machine's ledger only
+// on this model, were refused at 200,389,043 and 200,485,923 tokens counted
+// the same way. Its cap sits at about 2e8 — and its refusals name the reset
+// in Chinese (将在 … UTC+8 重置), which windowReset reads as well.
+//
+// deepseek-v4.1-flash-sg is the same model under its paid id (the product
+// config's ModelRateLimitCap.lines[0] names it as paidId to this freeId,
+// allowPaidSwitch: true) and draws on the same window: it was refused in
+// the same windows, to the second, with about 0.01M tokens of its own.
+// Both ids are named in models: magpie matches a plugin window's models
+// against a model id exactly, folding only an @size suffix
+// (internal/provider/plugin_usage.go, idSetOf), so one id alone leaves the
+// other unrestricted.
+//
+// The window is read two ways, and a refusal wins:
+//
+//   - the sum (in + cache_read + out) of this machine's rows, which holds
+//     until the account is first refused. The ledger is this machine's
+//     only, so an account also used on another machine or through another
+//     client reads short: 92.8M read as "93%" on one refused at 92,792,962,
+//     the rest of its spending being elsewhere.
+//   - a refusal whose named reset is still ahead, which makes the window
+//     full whatever the sum says. That is the one exact signal there is,
+//     and routing must not pass over it either.
+//
+// So the sum is an estimate, and it is shown, not routed on: its card is set
+// aside (aside: true), which magpie draws beside the account and never counts
+// as its allowance. Only a refusal's card stops the model. The estimate used
+// to stop it as well, and it read a paid China account at 99% of a cap it had
+// never been refused at, with 2,457 credits left (XiaoFeiyu9, plugins#641):
+// the cap is two accounts' measurement, the ledger is one machine's, and
+// neither is the vendor's word for this account. Nothing is lost by waiting
+// for that word: magpie's gateway reads the refusal's reset ("将在 … 重置",
+// "reset at …") and its "switch to the other models", and rests this model
+// alone, on this account alone, until the time the vendor named.
+//
+// The ledger is magpie's own, in magpie's config folder (appdir.Config()):
+// the folder the plugin host runs in, which is the portable data folder
+// when magpie runs portable, $XDG_CONFIG_HOME/magpie when that is set, and
+// ~/.config/magpie otherwise. No endpoint reports the window; a ledger that
+// cannot be read yields no window rather than a made-up one.
+
+// A window: the build's ledger rows it counts (provider and model), the cap
+// it reports against, and how its card reads. Two builds, two sets of
+// windows: the same phone number can be signed in to both, and their ledgers
+// stay apart — one build's spending must not fill the other's window.
+//
+// The China caps are measured on this machine from the vendor's own
+// refusals, never the vendor's word, and each is an estimate: 2e8 for
+// deepseek-v4.1-flash (two accounts refused at 200.39M and 200.49M on
+// 2026-11-02), with the card saying so (`~` and "(est.)"). The card is
+// shown only — set aside, plugins#641 — so a cap that goes stale costs a
+// wrong percentage, never a wrongly rested model; the first refusal of a
+// window pins the card full at the reset the vendor names.
+//
+// One entry per model, and only models that have been measured: a guessed
+// cap would read wrong every day. Add an entry when another model's window
+// is measured; remove one when the vendor stops applying it.
+const CN_ESTIMATED_WINDOWS = [
+  {
+    provider: "workbuddy",
+    model: "deepseek-v4.1-flash",
+    aliases: ["deepseek-v4.1-flash-sg"],
+    cap: 2e8,
+    name: "deepseek-v4.1-flash tokens (est.)",
+    short: "~200M",
+    // no unit: the name already says tokens, and magpie's narrow account
+    // cards cut a unit short ("tok…") beside the nine-digit numbers
+    unit: "",
+  },
+]
+// WorkBuddy AI's window keeps the name it shipped with: there the model is
+// served at x0.00, so "Free model tokens" is what it is.
+const FREE_WINDOW_AI = {
+  provider: "workbuddy-ai",
+  model: "deepseek-v4.1-flash",
+  aliases: ["deepseek-v4.1-flash-sg"],
+  cap: 1e8,
+  name: "Free model tokens",
+  short: "100M",
+  unit: "tokens",
+}
+const FREE_WINDOW_SPAN = 24 * 3600 * 1000
+// The lead: how far back of an edge the read goes on. A chain read from a row
+// that opens a window needs the window the span makes of the rows above it,
+// so the rows kept reach a day past the edge — the window opening at the
+// request after it, minutes to hours into that day, whatever the first row
+// after the edge falls on.
+const FREE_WINDOW_LEAD = 86400 * 1000
+// A gap this long between two of this account's answered rows ends every
+// window before it, so the later row opens one: the window holding the
+// earlier row began at most 24h before it, and so ended 24h after it at the
+// latest. This is one of the two edges the ledger itself spells out.
+const FREE_WINDOW_GAP = FREE_WINDOW_SPAN
+// the model a window is counted for is its spec's `model`; `aliases` are the
+// ids that share the window (-sg is the same model under its paid id), and
+// both are named in the card's models so magpie's exact match finds them
+
+// windowOffset is the UTC offset a refusal spells out, in minutes, from
+// "UTC+8", "UTC+08:00", "UTC-5" or "GMT+8". null when it spells out none,
+// which is not the same as +08:00: an offset guessed wrong puts the reset
+// hours from where it is, so a reset that cannot be placed is not used as
+// an edge at all.
+function windowOffset(text) {
+  const m = /\b(?:UTC|GMT)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?\b/i.exec(String(text ?? ""))
+  if (!m) return null
+  const min = Number(m[2]) * 60 + Number(m[3] ?? 0)
+  if (min > 14 * 60) return null
+  return m[1] === "-" ? -min : min
+}
+
+// windowReset is the instant a refusal names, or NaN when it names none or
+// names it in an offset that cannot be read. Both builds name it — WorkBuddy
+// AI in its English "will reset at …", the China build in its Chinese
+// "将在 … 重置" — with the time in the same shape, so the two patterns share
+// the group numbering and the offset below reads the "UTC+8" either way.
+function windowReset(text) {
+  const s = String(text ?? "")
+  const at =
+    /reset at (\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(s) ||
+    /将在\s*(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(s)
+  if (!at) return NaN
+  const off = windowOffset(s)
+  if (off === null) return NaN
+  return Date.UTC(+at[1], +at[2] - 1, +at[3], +at[4], +at[5], +at[6]) - off * 60000
+}
+
+// freeWindowOf is the window account is in now, from rows (magpie's usage
+// records), or null when it has lapsed — the next request opens a new one.
+// now is passed in so the reading is testable; win is the build's window
+// (which build's rows count, what cap they fill), AI by default.
+//
+// The window is a chain: it begins at the first request answered after the
+// previous one ended, so where this window began depends on every window
+// before it. A window ends at a refusal's reset when the ledger holds one,
+// and otherwise a day after it began. readLedgerTail (which see) stops on
+// both, so that these rows read the same as the whole ledger.
+function freeWindowOf(rows, account, now = Date.now(), win = FREE_WINDOW_AI) {
+  const mine = (Array.isArray(rows) ? rows : []).filter(
+    (r) =>
+      r?.provider === win.provider &&
+      r.providerAccount === account &&
+      typeof r.model === "string" &&
+      r.model.startsWith(win.model) &&
+      r.t,
+  )
+  if (!mine.length) return null
+
+  const at = (r) => {
+    const t = Date.parse(r.t)
+    return Number.isFinite(t) ? t : 0
+  }
+  const counted = (r) => (r.in ?? 0) + (r.cache_read ?? 0) + (r.out ?? 0)
+  // two rows a day apart: the first of them opened a window that has ended by
+  // the second. Written as a function so that no minifier folds the
+  // subtraction into the comparison.
+  const apart = (a, b) => a - b >= FREE_WINDOW_SPAN
+
+  // a refusal names the end of the window it refused in
+  const edges = []
+  for (const r of mine) {
+    if (Number(r.status) !== 429) continue
+    const t = windowReset(r.err)
+    if (Number.isFinite(t)) edges.push(t)
+  }
+  edges.sort((a, b) => a - b)
+
+  const answered = mine.filter((r) => Number(r.status) === 200 && at(r) > 0).sort((a, b) => at(a) - at(b))
+  if (!answered.length) return null
+
+  const head = (from) => {
+    let start = null
+    let used = 0
+    let edge = 0 // the refusals already read
+    for (let i = from; i < answered.length; i++) {
+      const r = answered[i]
+      const t = at(r)
+      // every refusal this row's window ended at closes it
+      while (edge < edges.length && edges[edge] <= t) {
+        start = null
+        used = 0
+        edge++
+      }
+      if (start === null) start = t
+      else if (apart(t, start)) {
+        start = t
+        used = 0
+      }
+      used += counted(r)
+    }
+    return start === null ? null : { start, used }
+  }
+
+  // The rows may begin before the window now: readLedgerTail goes a day past
+  // the edge it stops at, so the run of rows that opens a window can start a
+  // day after the first row kept. That window opens at a row with no answered
+  // row of this account's within a day before it — where the chain is read
+  // from. Read from the first row kept, the chain would begin shifted, a day
+  // early: every window after it, the card with it.
+  let w = null
+  for (let i = 0; i < answered.length; i++) {
+    if (i && !apart(at(answered[i]), at(answered[i - 1]))) continue
+    const h = head(i)
+    if (h === null) continue
+    if (h.start + FREE_WINDOW_SPAN <= now) continue // lapsed before now
+    w = h
+    break
+  }
+  const start = w?.start
+  const used = w?.used
+  if (!(start > 0)) return null
+
+  const end = start + FREE_WINDOW_SPAN
+  if (now >= end) return null // lapsed: nothing is exhausted, a new window opens on the next request
+
+  const card = (amount, resetsAt, refused) => ({
+    name: win.name,
+    used: Math.min(100, (100 * amount) / win.cap),
+    amount,
+    limit: win.cap,
+    unit: win.unit,
+    display: `${tokensShort(amount)} / ${win.short}`,
+    resetsAt: new Date(resetsAt).toISOString(),
+    span: FREE_WINDOW_SPAN / 1000,
+    // the window's own model and the ids that share it, so magpie's exact
+    // match finds every id it limits
+    models: [win.model, ...win.aliases],
+    // the ledger's sum is an estimate, shown and set aside; the vendor's
+    // refusal is the one that stops the model (see the window above)
+    ...(refused ? { refused: true } : { aside: true }),
+  })
+
+  // A refusal still in force is exact: the account is spending this window
+  // from elsewhere too, so the sum undercounts it, and the refusal is the
+  // answer the vendor would give again. Its reset is the window's end,
+  // named by the vendor rather than derived from start.
+  let live = null
+  for (const r of mine) {
+    if (Number(r.status) !== 429) continue
+    const t = windowReset(r.err)
+    if (!Number.isFinite(t) || t <= now || t <= start) continue
+    if (live === null || t > live) live = t
+  }
+  if (live !== null) return card(win.cap, live, true)
+
+  return card(used, end, false)
+}
+
+// tokensShort says a token count small: 11.9M, 812k. The credits card's
+// compact() (2 decimals, credited to credits) reads a token count badly.
+function tokensShort(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
+  if (n >= 1e3) return `${Math.round(n / 1e3)}k`
+  return String(Math.round(n))
+}
+
+// ledgerParsed is the rows read last and what they were read for: the file's
+// fingerprint, the account and the instant. A file that has not changed hands
+// back the rows already parsed rather than reading and decoding them again.
+//
+// Reading the ledger whole was 48 ms on 2026-10-21 (10.3 MiB, 17925 lines:
+// 6.4 ms to read, 32.8 ms to JSON.parse, 8 ms to find the window), spent
+// synchronously on the plugin host's thread every time a panel opened or a
+// card was asked about, which is what made the free-token window feel slow
+// beside the credits, whose reading is a network call and so blocks nothing.
+// A heavy ledger runs to hundreds of MiB, so the read starts at the end.
+//
+// The key carries the account because the rows are this account's: one
+// account's read must not answer for another's. A read for an earlier instant
+// keeps all the rows a read for a later one would — the bounds are only
+// further back, and an edge is the same time in either — so the rows held
+// over answer for the later one too: freeWindowOf is what decides with its
+// own now.
+let ledgerParsed = null
+
+// ledgerBad is the number of whole lines the ledger last had that could
+// not be decoded, and the file it was read from, so that a ledger read
+// once and read again is complained about once, not on every panel open.
+let ledgerBad = { key: "", count: 0 }
+
+// freeWindowLedger is the ledgers looked for, in magpie's own folder order
+// (appdir.Config()): the plugin host runs in that folder — the portable
+// data folder when magpie runs portable, $XDG_CONFIG_HOME/magpie when that
+// is set, ~/.config/magpie otherwise — so its cwd answers first; the other
+// two are named as well, for a plugin asked outside the host. The first
+// readable ledger wins: a stale copy in a folder magpie does not use must
+// not hide the live one.
+//
+// $XDG_CONFIG_HOME counts only when it is absolute, as appdir.rooted has it:
+// an empty or relative value is not where magpie keeps its ledger.
+function freeWindowLedger(cwd = process.cwd(), env = process.env, home = homedir()) {
+  const dirs = [cwd]
+  if (env.XDG_CONFIG_HOME && isAbsolute(env.XDG_CONFIG_HOME)) dirs.push(join(env.XDG_CONFIG_HOME, "magpie"))
+  if (home) dirs.push(join(home, ".config", "magpie"))
+  return dirs.map((d) => join(d, "usage.jsonl"))
+}
+
+// freeWindowRows reads magpie's usage ledger for account, oldest row first.
+// null when no ledger can be read: the window is then left unknown rather
+// than guessed.
+//
+// The ledger is appended to a line at a time, so a read that lands while a
+// call is being written can catch that line half-written. Only the last
+// line can be torn that way (everything before it was written whole), and
+// only it is passed over in silence. A whole line in the middle that won't
+// decode is a real fault — a truncated file, a writer that lost a record —
+// and is said aloud, because passing it over quietly is how a window goes
+// missing with nothing to point at: on 2026-10-21 a restart caught the
+// ledger mid-write, the one row holding the free window's start was
+// dropped without a word, and the panel showed no window at all until the
+// next read happened to succeed.
+function freeWindowRows(account, now = Date.now(), cwd = process.cwd(), env = process.env, home = homedir(), win = FREE_WINDOW_AI) {
+  if (!account) return null
+  let found = null
+  for (const path of freeWindowLedger(cwd, env, home)) {
+    try {
+      const st = statSync(path)
+      if (!st.size) continue
+      found = { path, st }
+      break
+    } catch {}
+  }
+  if (!found) return null
+  const { path, st } = found
+  // size and mtime both move when a call is appended, which is the only
+  // way this ledger is written; one rewritten in place (a rotation or a
+  // compaction) moves mtime even when its size lands the same.
+  const file = path + "|" + st.mtimeMs + ":" + st.size
+  // the key carries the account, the build and the model: one account's
+  // rows are its own, the two builds' chains over one ledger must not
+  // answer for each other (the same phone number can be signed in to both),
+  // and two windows of one build count different models
+  const key = file + "|" + win.provider + "|" + win.model + "|" + account
+  if (ledgerParsed?.key === key) return ledgerParsed.rows
+  let got
+  try {
+    got = readLedgerTail(path, st, now, undefined, account, win)
+  } catch {
+    return null
+  }
+  if (got.bad && ledgerBad.key !== file) {
+    ledgerBad = { key: file, count: got.bad }
+    console.error(
+      `workbuddy: ${got.bad} whole line${got.bad === 1 ? "" : "s"} of ${path} could not be decoded ` +
+        `(not the last line, so not a write in progress); the free-token window may read short`,
+    )
+  }
+  ledgerParsed = { key, rows: got.rows }
+  return got.rows
+}
+
+// LEDGER_T is where a row's time sits: "t" is among the first keys
+// usage.Record writes, within this many bytes of the line's start, so every
+// line's time is read without decoding the line — most of a ledger's lines
+// belong to another provider, or to this account and out of reach.
+const LEDGER_T = /"t"\s*:\s*"([^"]{10,64})"/
+
+// LEDGER_ACCOUNT finds the account a line was written under, before the line
+// is decoded. usage.Record writes providerAccount second.
+const LEDGER_ACCOUNT = /"providerAccount"\s*:\s*"([^"]{0,256})"/
+
+// rowTime is the instant a line is written at, from that "t", or NaN.
+function rowTime(line) {
+  const m = LEDGER_T.exec(line)
+  return m ? Date.parse(m[1]) : NaN
+}
+
+// LEDGER_REPORTED finds what a client reported: POST /v1/magpie/usage/requests
+// (#1874) appends a client's own calls to the same ledger, with the time the
+// client gives them, and a past time is kept on purpose so history can be
+// backfilled (docs/integrating.md). Such a row is written at the end of the
+// file and dated anywhere, so it says nothing about where the file's own
+// records have got to — magpie's index leaves it out of firstOwn for the same
+// reason (log_index.go). It never carries providerAccount, being not in
+// ingestFields, so it is never a row of this account either.
+const LEDGER_REPORTED = /"source"\s*:\s*"reported"/
+
+// rowReported is whether a line is one a client reported rather than one
+// magpie wrote when it happened.
+function rowReported(line) {
+  return LEDGER_REPORTED.test(line)
+}
+
+// rowAccount is the account a line was written under, or null when the line
+// names none (another record, or one cut short).
+function rowAccount(line) {
+  const m = LEDGER_ACCOUNT.exec(line)
+  if (!m) return null
+  try {
+    return JSON.parse(`"${m[1]}"`)
+  } catch {
+    return null
+  }
+}
+
+// ofAccount is whether a row belongs to the chain read for account: this
+// account's own row of the window's model, either id. A refusal of another
+// account's, of the other build, or of another model says nothing about
+// where this chain opens.
+function ofAccount(row, account, win = FREE_WINDOW_AI) {
+  return (
+    row?.provider === win.provider &&
+    row.providerAccount === account &&
+    typeof row.model === "string" &&
+    row.model.startsWith(win.model)
+  )
+}
+
+// readLedgerTail decodes the ledger from its end backwards, and stops where
+// the chain of account's own rows can still be read from. chunks is a test's
+// way of counting reads; nothing else passes it.
+//
+// Why it cannot stop at 48h: the window is a chain — each one starts at the
+// first request answered after the previous one ended — so where the window
+// now began depends on every window before it. A first row that is not an
+// edge opens the window in the middle of a real one and every window after
+// it is shifted: 4% on an account two hours from its cap, or 100% on one
+// still served, which routing would then pass over. So the read goes back
+// until the rows it keeps read the window now as the whole ledger does:
+//
+//   - a refusal of this account's, whose reset can be read: the window it
+//     named ended there, and the next request opened another;
+//   - a gap of 24h or more between two of this account's answered rows: the
+//     window holding the earlier one has ended by then, and the later one
+//     opens one;
+//   - and with neither, it reads to the file's start, where the chain has no
+//     earlier window to be shifted by.
+//
+// Each edge is passed by a day (FREE_WINDOW_LEAD), the window opening at the
+// request after it, minutes to hours into the day.
+//
+// Two bounds keep that from being a whole file on every poll, and neither
+// depends on how busy the account is:
+//
+//   - the ledger is appended in time order, so a line whose time is under the
+//     edge — of whatever provider, of whatever account — ends the read;
+//   - a read that is past now - 24h with no answered free-model row of this
+//     account has nothing to report: the window has lapsed, and freeWindowOf
+//     says null. It stops there rather than going on to the edges.
+//
+// Every line's time is read from its "t" before the line is decoded, so a
+// line of another provider or account costs one match and no JSON.parse.
+//
+// What is not covered: magpie's providerAccount is the account's label, and a
+// label two accounts share gets its slot added to it (pluginLabels,
+// plugin_accounts.go). The label then no longer equals the accountId rows are
+// written under, no row is found for this account at all, and the card
+// reports no free window.
+function readLedgerTail(path, st, now, chunks, account, win = FREE_WINDOW_AI) {
+  const CHUNK = 1 << 16
+  const lapsed = now - FREE_WINDOW_SPAN // a read past this holds no window now
+  const fd = openSync(path, "r")
+  try {
+    // a ledger whose last byte ends a line has no line being written
+    let tornEnd = false
+    if (st.size > 0) {
+      const one = Buffer.allocUnsafe(1)
+      readSync(fd, one, 0, 1, st.size - 1)
+      tornEnd = one[0] !== 0x0a
+    }
+    const rev = [] // the rows kept, latest first
+    let bad = 0
+    let pos = st.size
+    let carry = ""
+    let firstPass = true
+    let stop = false
+    const edge = pinning() // where this account's own rows read so far say the chain is read from
+    let reach = 0 // the row below which nothing is kept: 0 until an edge is found
+    let answered = false // whether an answered free-model row of it is read
+
+    while (pos > 0 && !stop) {
+      const len = Math.min(CHUNK, pos)
+      pos -= len
+      const buf = Buffer.allocUnsafe(len)
+      readSync(fd, buf, 0, len, pos)
+      if (chunks) chunks(1)
+      const lines = (buf.toString("utf8") + carry).split("\n")
+      carry = lines.shift() // its first line is begun in an earlier chunk
+      for (let i = lines.length - 1; i >= 0 && !stop; i--) {
+        const line = lines[i]
+        if (!line.trim()) continue
+        const t = rowTime(line)
+        // Under an edge or the bound, by time alone: nothing below it can be
+        // kept, whatever wrote it — but a line a client reported is dated
+        // where the client's call happened, not where the file has got to.
+        const dated = Number.isFinite(t) && !rowReported(line)
+        if (dated && reach && t < reach) {
+          stop = true
+          break
+        }
+        // A day back with nothing of this account's answered and no edge in
+        // reach: no window is being spent now, and nothing below can open one
+        if (dated && !reach && !answered && t < lapsed) {
+          stop = true
+          break
+        }
+        // Another provider's or another account's line: nothing else to see
+        if (!line.includes(account) || rowAccount(line) !== account) continue
+        let row
+        try {
+          row = JSON.parse(line)
+        } catch {
+          // the last line may be a call still being written, and is passed
+          // over; anything before it is a fault worth saying
+          if (!(firstPass && tornEnd && i === lines.length - 1)) bad++
+          continue
+        }
+        if (!ofAccount(row, account, win)) continue
+        rev.push(row)
+        if (Number(row.status) === 200) answered = true
+        if (!reach) reach = edge(row)
+      }
+      firstPass = false
+    }
+    // the file's first line, with no newline before it: kept only when the
+    // read ran to the file's start
+    if (!stop && pos === 0 && carry.trim() && carry.includes(account) && rowAccount(carry) === account) {
+      const t = rowTime(carry)
+      if (!reach || !Number.isFinite(t) || t >= reach) {
+        try {
+          const row = JSON.parse(carry)
+          if (ofAccount(row, account, win)) rev.push(row)
+        } catch {
+          bad++
+        }
+      }
+    }
+    return { rows: rev.reverse(), bad }
+  } finally {
+    closeSync(fd)
+  }
+}
+
+// pinned is where the chain of account's own rows (latest first) is read
+// from: the time below which nothing is kept. 0 while the rows say nothing
+// about it yet, and the read then goes to the file's start.
+//
+// A row whose time cannot be read is passed over rather than ending the
+// chain there: one corrupt line used to cut it wherever it sat.
+function pinned(rows, account) {
+  const at = (r) => Date.parse(r?.t)
+  const apart = (a, b) => a - b >= FREE_WINDOW_GAP
+  // A refusal names where a window ended, and the next request opened
+  // another. The loop walks oldest to newest and overwrites `denied`, so the
+  // one kept is the *newest* readable refusal in the chain, not the earliest:
+  // a later refusal is nearer to now, and its reset is the tighter bound on
+  // where the chain can be read from. A refusal whose reset has already been
+  // passed by a newer one therefore loses, which is what we want — the old
+  // `reset < newest` test that used to guard this is gone, the overwrite does
+  // the same job and keeps the latest.
+  let denied = null
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const reset = Number(rows[i]?.status) === 429 ? windowReset(rows[i].err) : NaN
+    if (Number.isFinite(reset)) denied = reset
+  }
+  if (denied !== null) return denied - FREE_WINDOW_LEAD
+  // A day's gap between two answered rows ended every window before it, and
+  // the day before the later row is where the span's reading of the rows
+  // above it begins. The rows come latest first, so each is compared with the
+  // one read before it — the row after it in time, `later`.
+  let later = null
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const r = rows[i]
+    const t = at(r)
+    if (!Number.isFinite(t)) continue
+    if (Number(r.status) !== 200) continue
+    if (later === null) {
+      later = t
+      continue
+    }
+    if (apart(t, later)) return later - FREE_WINDOW_LEAD
+    later = t
+  }
+  // no edge among these rows: the read goes on to the file's start, which is
+  // the whole ledger — the only place a chain needs nothing before it
+  return 0
+}
+
+// pinning is pinned read a row at a time: it is handed the account's own
+// rows latest first, as readLedgerTail reads them, and answers each with what
+// pinned would answer for every row handed so far — in constant time.
+//
+// readLedgerTail used to call pinned on its whole chain after each row, and
+// pinned walks the chain, so a chain with no edge in it cost the square of
+// its rows: 10.5 s for 16,000 rows on mote, a minute and more for an account
+// a server spends on all day (a call a minute is 43,000 rows in a month).
+// That ran on the plugin host's one thread at every usage read, and the
+// ledger changes with every call, so nothing held it over: the host sat at
+// 99% CPU and every session through it stalled (xmoon76 on Discord, the
+// China build's window being read since 0.2.12).
+//
+// It holds because the rows only ever grow at their oldest end, and pinned
+// was asked only while it answered 0 — no readable refusal and no day's gap
+// among the rows so far — so the one new thing a row can bring is:
+//
+//   - a refusal with a readable reset: the newest such is the first read,
+//     and pinned answers it whatever else the rows hold, once a row that is
+//     not a refusal follows (readLedgerTail asked pinned for those alone);
+//   - a day's gap between it and the oldest answered row before it, the only
+//     pair of answered rows not already looked at. pinned answers that with
+//     the older row of the pair, this one.
+function pinning() {
+  let denied = null // the newest readable refusal's reset
+  let oldest = null // the oldest answered row's time so far
+  return (row) => {
+    const status = Number(row?.status)
+    if (status === 429) {
+      if (denied === null) {
+        const reset = windowReset(row.err)
+        if (Number.isFinite(reset)) denied = reset
+      }
+      return 0
+    }
+    if (denied !== null) return denied - FREE_WINDOW_LEAD
+    if (status !== 200) return 0
+    const t = Date.parse(row?.t)
+    if (!Number.isFinite(t)) return 0
+    if (oldest !== null && oldest - t >= FREE_WINDOW_GAP) return t - FREE_WINDOW_LEAD
+    oldest = t
+    return 0
+  }
+}
+
+// _internal is where these are handed to a test: magpie's host calls every
+// exported function of a plugin as one of its own factories (host.js,
+// servers()), so freeWindowRows et al. must not be exports of the plugin.
+
 // usageOf is the account's credits, from its resource summary: the plan's
 // credits used against what the cycle grants, as magpie's built-in said —
 // the count itself too (amount of limit, in credits), for magpie to say it
 // as used or left beside the share (magpie#659). The free plan is said as a
 // plan: "Free" alone beside the account read as the model being free, and
 // routing as preferring it for that (#337).
-function usageOf(sum, plan) {
+//
+// A package with no CycleTotalCapacity has no denominator: it is sent as
+// magpie's balance-shaped window (#3950), {balance, unit} with no used,
+// limit or aside, and routing ranks it by what is left. A literal "0" total
+// is still a total, not a wallet: it stays on the old path, so a lapsed or
+// placeholder package adds nothing. A literal "0" remainder is a reading
+// of nothing left, not an absent field; only a package with no
+// CycleRemainCapacity at all leaves the window out. TotalCredits is not a
+// fallback: an account with no packages at all keeps its unknown allowance,
+// as before, so its free models are not skipped.
+//
+// The plan's own credits and the rest are two windows (akic404 on
+// Discord): summed, the gifted and activity packages' credits used long
+// ago put the card at most of its allowance on the first day of the
+// month, and the plan's pace line said nothing. "Credits" is the plan's
+// base credits and "Extra credits" every other kind, as WorkBuddy's own
+// usage panel breaks them down (Jiabubu on Discord: a plan's bonus and
+// bought credits were nowhere on the card). The summary's CreditGroups
+// say it in WorkBuddy's words: plan_base ("Plan Base Credits") is the
+// plan's, plan_bonus, addon ("Top-up Credits") and benefit ("Platform
+// Reward Credits") are extra. A summary without them is split by code as
+// the client's resolveCreditGroup does (PLAN_CODES, see planCodes). A
+// summary with only one kind keeps the one "Credits" window, as before.
+//
+// Only one of the two stops the account at a time: WorkBuddy serves it
+// while any credits are left, so the one set aside is the one whose
+// running out doesn't stop it — "Extra credits", until the plan's are
+// spent and extra ones are left.
+function usageOf(sum, plan, site) {
   const out = { plan: plan || (sum?.IsPaidUser ? "Pro" : "Free plan"), windows: [] }
-  let total = 0, used = 0
-  for (const p of sum?.Packages ?? []) {
-    total += capacity(p?.CycleTotalCapacity)
-    used += capacity(p?.CycleUsedCapacity)
+  const { plan: mine, extra, left, bags } = kindsOf(sum, site)
+  if (mine.total > 0 && extra.total > 0) {
+    const credits = creditWindow("Credits", mine), more = creditWindow("Extra credits", extra)
+    if (mine.used >= mine.total && extra.used < extra.total) credits.aside = true
+    else more.aside = true
+    out.windows.push(credits, more)
+  } else {
+    const total = mine.total + extra.total, used = mine.used + extra.used
+    if (total > 0) out.windows.push(creditWindow("Credits", { used, total }))
   }
-  if (total > 0) out.windows.push({ name: "Credits", used: (100 * used) / total, display: `${compact(used)} / ${compact(total)}`, amount: used, limit: total, unit: "credits" })
+  const total = mine.total + extra.total
+  if (bags > 0 && (total === 0 || left > 0)) out.windows.push({ name: "Prepaid credits", balance: left, display: `${compact(left)} credits`, unit: "credits" })
   return out
+}
+
+// creditWindow is a window of credits used of a total.
+const creditWindow = (name, { used, total }) => ({ name, used: (100 * used) / total, display: `${compact(used)} / ${compact(total)}`, amount: used, limit: total, unit: "credits" })
+
+// kindsOf is the summary's credits, the plan's and the extra ones (see
+// usageOf), and what is left in its packages with no total (a prepaid
+// balance).
+function kindsOf(sum, site) {
+  const ofPlan = planCodes(sum, site)
+  const kinds = { plan: { total: 0, used: 0 }, extra: { total: 0, used: 0 }, left: 0, bags: 0 }
+  const hasTotal = (p) => p?.CycleTotalCapacity != null && p.CycleTotalCapacity !== ""
+  const add = (k, p) => ((k.total += capacity(p.CycleTotalCapacity)), (k.used += capacity(p?.CycleUsedCapacity)))
+  const groups = (Array.isArray(sum?.CreditGroups) ? sum.CreditGroups : []).filter(hasTotal)
+  for (const g of groups) add(kinds[g?.Kind === "plan_base" ? "plan" : "extra"], g)
+  for (const p of sum?.Packages ?? []) {
+    if (hasTotal(p)) {
+      if (!groups.length) add(kinds[ofPlan(p?.PackageCode) ? "plan" : "extra"], p)
+    } else if (p?.CycleRemainCapacity != null && p.CycleRemainCapacity !== "") {
+      kinds.left += capacity(p.CycleRemainCapacity)
+      kinds.bags++
+    }
+  }
+  return kinds
+}
+
+// listedExtra is the extra credits of the detail lists (packagesOf) that
+// the summary doesn't list at all, as WorkBuddy's own usage panel counts
+// them (jiabubu on Discord, magpie 0.1.2774, a China-site free account:
+// magpie's card read "0 / 500" alone, while the panel shows the extra
+// kinds beside the plan's). The panel's groups come from the detail
+// lists, not the summary (buildCreditGroups over fetchUserResources' paid
+// and free lists), and leave out a package past its end; a slice package
+// (CapacityType 4) counts the day's slice, as resolveResourceCapacity
+// does. null when there are none with credits.
+function listedExtra(sum, packages, site, now = Date.now()) {
+  const summed = new Set((sum?.Packages ?? []).map((p) => p?.PackageCode))
+  const codes = site?.ai ? [...EXTRA_CODES, ...EXTRA_AI] : EXTRA_CODES
+  let total = 0, left = 0, at = 0, lapsing = 0
+  for (const p of packages ?? []) {
+    const code = p?.PackageCode
+    if (!codes.includes(code) || summed.has(code)) continue
+    const end = endOf(p)
+    if (end > 0 && end <= now) continue
+    const slice = String(p?.CapacityType) === SLICE ? p?.SlicePeriodUsageDetails?.[0] : null
+    const of = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0 }
+    const t = of(slice ? slice.SlicePeriodCapacitySizePrecise : p?.CycleCapacitySizePrecise)
+    const l = Math.min(t, of(slice ? slice.SlicePeriodCapacityRemainPrecise : p?.CycleCapacityRemainPrecise))
+    if (!(t > 0)) continue
+    total += t
+    left += l
+    if (l > 0 && end > 0 && !slice) {
+      if (!at || end < at) at = end, lapsing = l
+      else if (end === at) lapsing += l
+    }
+  }
+  if (!(total > 0)) return null
+  return { total, used: total - left, ...(at ? { runsOutAt: new Date(at).toISOString(), runsOut: lapsing } : {}) }
 }
 
 // enterpriseUsageOf is an enterprise (team) account's credits, from
@@ -1705,7 +3080,7 @@ async function spareFree(site, a, windows) {
 // detail list without them (10001 "PackageCodes required").
 const CODE = (n, s) => `TCACA_code_${n}_${s}`
 const PAID_CODES = [CODE("002", "AkiJS3ZHF5"), CODE("005", "maRGyrHhw1"), CODE("003", "FAnt7lcmRT"), CODE("023", "4xbGhMrE6q"),
-  CODE("026", "BaESVICNoi"), CODE("027", "0FCGVA6vSa"), CODE("009", "0XmEQc2xOf"), CODE("038", "OhvqZtiPKr"), CODE("036", "lupO5WgNdG")]
+  CODE("026", "BaESVICNoi"), CODE("027", "0FCGVA6vSa"), CODE("043", "6oIkxT7Z0S"), CODE("009", "0XmEQc2xOf"), CODE("038", "OhvqZtiPKr"), CODE("036", "lupO5WgNdG")]
 const DAILY_CODE = CODE("001", "PqouKr6QWV")
 const FREE_CODES = [DAILY_CODE, CODE("008", "cfWoLwvjU4"), CODE("035", "ArVxJcGDsm"), CODE("006", "DbXS0lrypC"), CODE("039", "KRcQj7wUat"),
   CODE("040", "mi9rCYg46x"), CODE("007", "nzdH5h4Nl0"), CODE("028", "NtpWi0jzXs"), CODE("037", "WxOD3MpI2o"), CODE("029", "6wCGEWquYy"),
@@ -1713,6 +3088,37 @@ const FREE_CODES = [DAILY_CODE, CODE("008", "cfWoLwvjU4"), CODE("035", "ArVxJcGD
 // a slice package (CapacityType 4) is refreshed each day: its credits are
 // lost at the same midnight on every account, so they tell none apart
 const SLICE = "4"
+
+// PLAN_CODES are the plan's base credits, as WorkBuddy's client (WorkBuddy
+// AI 5.9.4) groups them in its usage panel (resolveCreditGroup's
+// planBase): Pro monthly, Pro monthly plus, Pro yearly, youth, advanced,
+// flagship, buddyOneVip, the international free plan (freeMonIntl), the
+// Pro trials, and on the China build alone the free plan's monthly base
+// (freeMon, 套餐基础积分). The plan's bonus (bonus28; bonusIntl, "Plan
+// Bonus Quota") comes back each cycle too, but the client says it apart
+// (planBonus), as it does the credit packs (009, 036, 038: addon) and
+// activity, bonus29/30 and gift (benefit).
+const PLAN_CODES = [CODE("002", "AkiJS3ZHF5"), CODE("005", "maRGyrHhw1"), CODE("003", "FAnt7lcmRT"), CODE("023", "4xbGhMrE6q"),
+  CODE("026", "BaESVICNoi"), CODE("027", "0FCGVA6vSa"), CODE("043", "6oIkxT7Z0S"), CODE("035", "ArVxJcGDsm"),
+  CODE("039", "KRcQj7wUat"), CODE("040", "mi9rCYg46x")]
+const FREE_MON = CODE("008", "cfWoLwvjU4")
+
+// EXTRA_CODES are the kinds of extra credits WorkBuddy's own usage panel
+// shows beside the plan's base (WorkBuddy 5.5.6, the China build's
+// resolveCreditGroup): the plan's bonus (bonus28, bonusIntl), top-ups
+// (extra 009, extra38 038, extraIntl 036) and platform rewards (activity
+// 007, bonus29, bonus30), and on WorkBuddy AI the free month (008) and
+// gift (006) too. The China build puts gift in no group, so it shows none.
+const EXTRA_CODES = [CODE("028", "NtpWi0jzXs"), CODE("037", "WxOD3MpI2o"), CODE("009", "0XmEQc2xOf"), CODE("038", "OhvqZtiPKr"),
+  CODE("036", "lupO5WgNdG"), CODE("007", "nzdH5h4Nl0"), CODE("029", "6wCGEWquYy"), CODE("030", "BjSt89qTvr")]
+const EXTRA_AI = [FREE_MON, CODE("006", "DbXS0lrypC")]
+
+// planCodes says whether a package of the summary is the plan's own: one
+// of PLAN_CODES on that site, or the subscription the summary names.
+function planCodes(sum, site) {
+  const sub = sum?.SubscriptionPackageCode
+  return (code) => !!code && (code === sub || PLAN_CODES.includes(code) || (!site?.ai && code === FREE_MON))
+}
 
 // beijing is WorkBuddy's own time ("2026-10-13 00:39:27" is UTC+8, as its
 // DeductionEndTime for the same package says).
@@ -1756,11 +3162,12 @@ function endOf(p) {
 // packages are lost, and how many (cdredfox on X): smart routing spends
 // the account whose credits expire first. Only packages the summary
 // counts, with credits left, and not the daily slice; null when none.
-function runsOutOf(sum, packages, now = Date.now()) {
+// only narrows it to the packages of one window (the split's, usageOf).
+function runsOutOf(sum, packages, now = Date.now(), only = () => true) {
   const counted = new Set((sum?.Packages ?? []).map((p) => p?.PackageCode))
   let at = 0, amount = 0
   for (const p of packages ?? []) {
-    if (!counted.has(p?.PackageCode) || p?.PackageCode === DAILY_CODE || String(p?.CapacityType) === SLICE) continue
+    if (!counted.has(p?.PackageCode) || !only(p?.PackageCode) || p?.PackageCode === DAILY_CODE || String(p?.CapacityType) === SLICE) continue
     const left = capacity(p?.CycleCapacityRemainPrecise ?? p?.CycleCapacityRemain)
     const end = endOf(p)
     if (!(left > 0) || end <= now) continue
@@ -1818,11 +3225,19 @@ function variants(efforts) {
 
 // configModels is the site's own list as a provider's models, each on the
 // API it is served on: a Claude model on Messages, the rest on chat.
+// A model declared here (before an account's list is read, for a key
+// whose CLI reads no config, or when /v3/config can't be read) takes images
+// unless textOnly says the site drops them: both sites' configs mark every
+// model supportsImages (read 2026-11-01), and a chat to WorkBuddy AI's
+// kimi-k3 with a two-colour PNG named both colours (plugins#572). Declared
+// text-only, as before, every model read as one that can't see.
 function configModels(site) {
   return Object.fromEntries(site.models.map(([id, name, context, efforts]) => [id, {
     name,
     limit: { context, output: 0 },
     tool_call: true,
+    attachment: !textOnly(site, id),
+    modalities: { input: textOnly(site, id) ? ["text"] : ["text", "image"], output: ["text"] },
     // OpenCode (and magpie's host) read a config model's package and URL
     // from provider: { npm, api }, not api
     ...(nativeOf(site, id) ? { provider: { npm: NPM_MESSAGES, api: apiMessages(site) } } : {}),
@@ -1954,10 +3369,70 @@ function effortsOf(d, site, id) {
   return EFFORT_ORDER.filter((e) => set.has(e))
 }
 
+// isCompletion is whether a request is a chat completion: one to
+// .../chat/completions, or, with no URL to read, a body holding a chat's
+// messages. Nothing else the loader's fetch sends (magpie's drawings to
+// /v2/images/*) is a chat: it goes neither gzipped nor given an effort.
+function isCompletion(url, chat) {
+  let path = ""
+  try {
+    path = new URL(String(url ?? "")).pathname
+  } catch {}
+  if (path) return /\/chat\/completions$/.test(path)
+  return Array.isArray(chat?.messages)
+}
+
+// defaultEffortOf is the level WorkBuddy's own client asks a model for when
+// the user picked none: its CLI's configureThinkingSettings (WorkBuddy
+// 5.9.3, CLI 2.165.0) takes the session's effort, else the settings', else
+// the config's reasoning.defaultEffort, else reasoning.effort, and sends it
+// as reasoning_effort unless thinking was turned off. A request with no
+// reasoning_effort is not thinking on WorkBuddy's side: measured 2026-10-28
+// on www.workbuddy.ai, deepseek-v4.1-flash (defaultEffort "high") answered
+// with 0 reasoning tokens without one, and thought at low and high
+// (troilus1011 on X, OpenCode's default variant). A default the model's
+// levels don't hold is left out, as the CLI clamps it to one they do.
+function defaultEffortOf(d, efforts) {
+  const own = d.reasoning?.defaultEffort ?? d.reasoning?.effort
+  return typeof own === "string" && efforts.includes(own) ? own : undefined
+}
+
+// SMALL_BUDGET is the largest output budget a chat can name and still be
+// one no client meant to think in: Anthropic's API takes thinking only with
+// a budget of at least 1024 tokens and a max_tokens above it, so a request
+// of 1024 or less can't have asked for thinking there, and a client's own
+// short asks (a session title, a classification) name such budgets. A
+// default effort spends them on reasoning: itspig (#643) saw 230+ title
+// requests at max_tokens 64 on deepseek-v4-pro end out=64, reasoning=64,
+// no text. Measured 2026-11-03 on www.workbuddy.ai, deepseek-v4.1-flash-sg
+// at its default high: max_tokens 64 ended "length" with 64 reasoning
+// tokens and no text; without an effort it answered the title.
+const SMALL_BUDGET = 1024
+
+// withDefaultEffort gives a chat that names no effort the model's default
+// (defaultEffortOf), as WorkBuddy's client sends it; true when it did. An
+// effort the client named, "none" too, goes as it came. A chat whose
+// max_tokens is SMALL_BUDGET or less is given none: WorkBuddy doesn't
+// think without one, so its budget goes to the answer.
+function withDefaultEffort(chat, list) {
+  if (!chat || typeof chat !== "object" || namesEffort(chat)) return false
+  const limit = chat.max_tokens ?? chat.max_completion_tokens
+  if (typeof limit === "number" && limit > 0 && limit <= SMALL_BUDGET) return false
+  const m = list?.find((x) => x.id === chat.model)
+  if (!m?.effort) return false
+  chat.reasoning_effort = m.effort
+  return true
+}
+
+// namesEffort is whether a chat names its effort itself, in either spelling
+function namesEffort(chat) {
+  return chat.reasoning_effort !== undefined || (!!chat.reasoning && typeof chat.reasoning === "object" && chat.reasoning.effort !== undefined)
+}
+
 async function liveModels(site, a) {
   const headers = new Headers()
   sign(site, a, headers)
-  headers.set("User-Agent", `CLI/${APP_VERSION} WorkBuddy/${UA_VERSION}`)
+  headers.set("User-Agent", cliAgent(site))
   headers.set("X-Requested-With", "XMLHttpRequest")
   headers.set("Accept", "application/json")
   const res = await fetch(site.endpoint + "/v3/config", { headers, signal: AbortSignal.timeout(15000) })
@@ -1979,7 +3454,10 @@ async function liveModels(site, a) {
         const es = effortsOf(d, site, id)
         if (es.length) {
           const canOff = d.reasoning?.canDisableThinking
-          m.efforts = [...(!d.onlyReasoning && (canOff == null || canOff) ? ["none"] : []), ...es]
+          const off = (!d.onlyReasoning && (canOff == null || canOff)) || OFF_TAKEN.has(id)
+          m.efforts = [...(off ? ["none"] : []), ...es]
+          const def = defaultEffortOf(d, es)
+          if (def) m.effort = def
         }
       }
       out.push(m)
@@ -2020,13 +3498,42 @@ const AFTER_TOOLS_REFUSED = /must end with a user message|["']code["']\s*:\s*["'
 // ending with the assistant's message is a prefill, refused as it is.
 function replyAfterTools(body) {
   const b = chatOf(body)
+  return replyAfterToolsOn(b) ? JSON.stringify(b) : null
+}
+
+// replyAfterToolsOn makes replyAfterTools's change on a chat's object; false
+// for a chat it doesn't take
+function replyAfterToolsOn(b) {
   const msgs = b?.messages
-  if (!Array.isArray(msgs)) return null
+  if (!Array.isArray(msgs)) return false
   let i = msgs.length - 1
   while (i >= 0 && msgs[i]?.role === "user") i--
-  if (i === msgs.length - 1 || i < 0 || msgs[i]?.role !== "tool") return null
+  if (i === msgs.length - 1 || i < 0 || msgs[i]?.role !== "tool") return false
   msgs.splice(i + 1, 0, { role: "assistant", content: "" })
-  return JSON.stringify(b)
+  return true
+}
+
+// FREE_ONLY is the switch that keeps an account off credits (#430): its
+// list holds only the models WorkBuddy serves at no cost (priceOf's free),
+// and a request for any other is answered here, never sent. A price that
+// can't be read is not free, and a list that can't be read sends nothing.
+const FREE_ONLY = "free_only"
+// PRICE_TTL is how long a list read for that check is used before it is
+// read again: a promotion that ends stops counting as free within it.
+const PRICE_TTL = 60_000
+
+// notFree is the answer to a request the switch keeps from WorkBuddy. Its
+// words say the model, not the account, is what is turned away, so magpie
+// rests that model alone and asks another provider of it; they name no
+// quota or credit, which would rest the whole account as out of credit.
+function notFree(site, model, why) {
+  const msg = why
+    ? `${site.name}'s model list couldn't be read (${why}), so whether model ${model || "(none)"} is free is unknown; with "Free models only" on it isn't sent`
+    : `model ${model || "(none)"} is not available while "Free models only" is on: ${site.name} charges for it. Turn the switch off in ${site.name}'s provider settings to use it`
+  return new Response(JSON.stringify({ error: { message: msg, type: "invalid_request_error", code: why ? "free_only_unknown" : "model_not_found" } }), {
+    status: why ? 503 : 404,
+    headers: { "content-type": "application/json", "X-Magpie-Sign-In": "kept" },
+  })
 }
 
 function makePlugin(site) {
@@ -2036,7 +3543,55 @@ function makePlugin(site) {
   // the system prompts this run WorkBuddy refused as an unapproved channel:
   // their next chats go with systemAsUser at once, not refused first
   const refusedSystems = new Set()
-  return async ({ client }) => ({
+  // the system prompts this run WorkBuddy refused as written and took with
+  // OPENERS' comma: their next chats go with the comma set before the first
+  // send, as a moved one goes moved. Without it every turn of that agent —
+  // and every step of its tool loop — pays a refused round trip first, which
+  // is latency on each request and a pattern of channel refusals on the
+  // account. Bounded as refusedSystems is.
+  const commaSystems = new Set()
+  return async ({ client, magpie }) => {
+  // each account's list as last read, for FREE_ONLY: {at, list}
+  const lists = new Map()
+  const listKey = (a) => `${a.uid ?? ""}|${a.enterpriseId ?? ""}|${a.source === "key" ? a.key : ""}`
+  // listed is the account's live list, read again past PRICE_TTL
+  const listed = async (a, fresh = false) => {
+    const k = listKey(a)
+    const was = lists.get(k)
+    if (!fresh && was && Date.now() - was.at < PRICE_TTL) return was.list
+    const list = await liveModels(site, a)
+    lists.set(k, { at: Date.now(), list })
+    if (lists.size > 64) lists.delete(lists.keys().next().value)
+    return list
+  }
+  // effortList is the list a chat's default effort is read from
+  // (withDefaultEffort): listed's, or null when there is none to read — a
+  // key WorkBuddy's CLI reads no config with (as models does), or a read
+  // that failed within PRICE_TTL, so a config that can't be read costs a
+  // chat one try a minute, not one each
+  const unlisted = new Map()
+  const effortList = async (a) => {
+    if (a.source === "key" && !remoteConfig(a.key)) return null
+    const k = listKey(a)
+    if (Date.now() - (unlisted.get(k) ?? 0) < PRICE_TTL) return null
+    try {
+      return await listed(a)
+    } catch {
+      unlisted.set(k, Date.now())
+      if (unlisted.size > 64) unlisted.delete(unlisted.keys().next().value)
+      return null
+    }
+  }
+  const freeOnly = () => magpie?.option?.(site.id, FREE_ONLY) === true
+  // onlyFree is a list with the switch on: its free models, or a failure
+  // when there are none to tell (magpie then keeps the list it had)
+  const onlyFree = (ms) => {
+    if (!freeOnly()) return ms
+    const free = ms.filter((m) => m.free)
+    if (!free.length) throw new Error(`${site.name} lists no free model, and "Free models only" is on`)
+    return free
+  }
+  return {
     config: async (config) => {
       config.provider ??= {}
       config.provider[site.id] ??= {}
@@ -2058,15 +3613,37 @@ function makePlugin(site) {
       // the account's own list, when it's signed in and WorkBuddy answers;
       // else the list above
       async models(provider, { auth }) {
+        if (auth?.type === "api") {
+          // asked as WorkBuddy's own CLI asks with a key (remoteConfig)
+          const a = keyAccount(auth)
+          if (!a || !remoteConfig(a.key)) {
+            if (freeOnly()) throw new Error(`${site.name} lists no prices for this key, and "Free models only" is on`)
+            return provider.models
+          }
+          let ms
+          try {
+            ms = await listed(a, true)
+          } catch (e) {
+            if (freeOnly()) throw e
+            return provider.models
+          }
+          if (!ms.length && !freeOnly()) return provider.models
+          return Object.fromEntries(onlyFree(ms).map((m) => [m.id, modelOf(site, provider, m)]))
+        }
         if (auth?.type !== "oauth" || !(auth.access || auth.source)) return provider.models
+        let ms
         try {
           const a = await current(site, client, auth)
-          const ms = await liveModels(site, a)
-          if (!ms.length) return provider.models
-          return Object.fromEntries(ms.map((m) => [m.id, modelOf(site, provider, m)]))
-        } catch {
+          ms = await listed(a, true)
+        } catch (e) {
+          // with the switch on, a list without prices would offer models
+          // that cost credits: the failure goes up, and magpie keeps the
+          // list it had
+          if (freeOnly()) throw e
           return provider.models
         }
+        if (!ms.length && !freeOnly()) return provider.models
+        return Object.fromEntries(onlyFree(ms).map((m) => [m.id, modelOf(site, provider, m)]))
       },
     },
     auth: {
@@ -2078,9 +3655,46 @@ function makePlugin(site) {
       // and is renewed as before.
       refreshLead: LEAD_MS,
       refresh: (auth) => refreshed(site, auth),
+      // the account's daily check-in: magpie can run it once a day per
+      // account, when its WorkBuddy check-in switch is on; the button in
+      // Settings asks right away. China's meter only: the AI build has no
+      // check-in (#47), so the hook stays off its plugin. Errors leave as
+      // throws, not as failed answers: host.js answers a throwing hook to
+      // magpie as an error, whose wbCheckinFailed keeps the offline words
+      // and magpie's 1-minute backoff, where a returned failed waits the
+      // full 30 minutes (magpie-community/plugins#149). checkinOf returns
+      // an outcome only for answers it read and classified.
+      ...(site.ai ? {} : {
+        async checkin(getAuth) {
+          const auth = await getAuth()
+          // an API key reads no credits (see usage), so it has no day to claim
+          if (auth?.type === "api") return { outcome: "ineligible", message: "check-in needs a signed-in account, not an API key" }
+          if (auth?.type !== "oauth" || !(auth.access || auth.source)) return { outcome: "failed", message: "not signed in" }
+          const a = await current(site, client, auth)
+          return await checkinOf(site, a, { waits: [2000, 4000] })
+        },
+      }),
+      options: [
+        {
+          key: FREE_ONLY,
+          label: "Free models only",
+          description: `Lists only the models ${site.name} serves at no cost, and turns away a request for any other here instead of sending it, so no credits are spent. A model free only at night counts as paid.`,
+          // the same words in magpie's other languages, and that the list
+          // leaves models out while it is on (plugins#590); magpie's own
+          // fields, which an older magpie and OpenCode leave alone
+          labels: { zh: "仅免费模型", "zh-TW": "僅免費模型", ja: "無料モデルのみ", de: "Nur kostenlose Modelle" },
+          descriptions: {
+            zh: `只列出 ${site.name} 免费提供的模型；其他模型的请求在这里就被拒绝、不会发出，因此不消耗积分。只在夜间免费的模型按付费算。`,
+            "zh-TW": `只列出 ${site.name} 免費提供的模型；其他模型的請求在這裡就被拒絕、不會送出，因此不消耗積分。只在夜間免費的模型以付費計。`,
+            ja: `${site.name} が無料で提供するモデルだけを表示し、ほかのモデルへのリクエストは送信せずここで断るので、クレジットを消費しません。夜間だけ無料のモデルは有料として扱います。`,
+            de: `Listet nur die Modelle, die ${site.name} kostenlos anbietet, und weist eine Anfrage an jedes andere hier ab, statt sie zu senden, sodass keine Credits verbraucht werden. Ein Modell, das nur nachts kostenlos ist, gilt als kostenpflichtig.`,
+          },
+          filtersModels: true,
+        },
+      ],
       async loader(getAuth) {
         const auth = await getAuth()
-        if (auth?.type !== "oauth") return {}
+        if (auth?.type !== "oauth" && auth?.type !== "api") return {}
         return {
           // no baseURL: a model's own api.url says where it is served —
           // <endpoint>/v2 for a chat, <endpoint>/v1 for a Claude model on
@@ -2089,8 +3703,9 @@ function makePlugin(site) {
           apiKey: "",
           async fetch(input, init) {
             const stored = await getAuth()
-            if (stored?.type !== "oauth") throw new Error(`${site.name} isn't signed in`)
-            let a = await current(site, client, stored)
+            const keyed = stored?.type === "api" ? keyAccount(stored) : null
+            if (stored?.type !== "oauth" && !keyed) throw new Error(`${site.name} isn't signed in`)
+            let a = keyed ?? (await current(site, client, stored))
             const req = input instanceof Request ? input : null
             const headers = new Headers(init?.headers ?? req?.headers)
             headers.delete("authorization")
@@ -2110,18 +3725,42 @@ function makePlugin(site) {
             // Codex's and DeepSeek Harness's openings all answer on
             // /v1/messages, where a chat is refused 11128.
             const native = isMessages(req ? req.url : String(input), body)
-            let names = {}
-            if (!native) {
-              body = withSystem(body)
-              const fit = fitted(body)
-              body = normalizeToolChoice(fit.body)
-              names = fit.names
-            } else {
-              body = withoutUnsigned(body)
+            // read once (prepared): nothing below parses the body again on
+            // its way out, and nothing keeps the parsed chat once it is
+            // written (plugins#461)
+            let chat, changed, names
+            ;({ body, chat, changed, names } = prepared(body, native))
+            if (native) names = {}
+            // the switch is checked before anything is sent: a model not
+            // free, or one whose price can't be read, never reaches
+            // WorkBuddy. The model is read off the chat parsed above; a body
+            // prepared leaves unread (bytes on Messages) is read for it.
+            if (freeOnly()) {
+              const model = (chat ?? chatOf(typeof body === "string" ? body : bodyString(body)))?.model
+              let list
+              try {
+                list = await listed(a)
+              } catch (e) {
+                return notFree(site, model, e?.message ?? String(e))
+              }
+              if (!list.some((m) => m.id === model && m.free)) return notFree(site, model)
             }
-            attend(headers, body, session)
-            const post = (b) =>
-              fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: b }).catch((e) => unanswered(site, a, b, e, init?.signal))
+            // a chat that names no effort is asked at the model's default,
+            // as WorkBuddy's client asks it (withDefaultEffort); with no
+            // list to read (effortList) the chat goes as it came
+            const completion = !native && isCompletion(req ? req.url : input, chat)
+            if (completion && chat && !namesEffort(chat) && withDefaultEffort(chat, await effortList(a))) changed = true
+            chatHeaders(site, headers)
+            let who = scopeOf(a)
+            let ids = attendChat(headers, chat, session, who)
+            const post = (b) => {
+              // a chat goes gzipped, as WorkBuddy's client sends it
+              // (gzipped); its size on the wire is what unanswered weighs
+              const z = gzipped(completion, b)
+              if (z) headers.set("Content-Encoding", "gzip")
+              else headers.delete("Content-Encoding")
+              return fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: z ?? b }).catch((e) => unanswered(site, a, z ?? b, e, init?.signal))
+            }
             // a 401 is answered once, on whichever try meets it: by a
             // sign-in with another access token (reissued), the request
             // sent once more with it, never again after that; else, or
@@ -2147,6 +3786,12 @@ function makePlugin(site) {
               const res = await post(b)
               if (res.status !== 401) return res
               if (renewed) return out("it refused the token renewed for it too", invalidToken(res), res)
+              // a key isn't renewed: the 401 says the key was refused
+              if (a.source === "key") {
+                const r = keyRefused(site, invalidToken(res), edgeNotes.get(res))
+                ours.add(r)
+                return r
+              }
               if (!resendable(b)) return res
               await res.body?.cancel().catch(() => {})
               const r = await reissued(site, client, getAuth, a, stored.access)
@@ -2154,19 +3799,32 @@ function makePlugin(site) {
               renewed = true
               a = r.a
               sign(site, a, headers)
+              ids = reattend(headers, ids, who, (who = scopeOf(a)))
               const again = await post(b)
               if (again.status !== 401) return again
               return out("it refused the token renewed for it too", invalidToken(again), again)
             }
             // a model known to turn tool results then the user's message away
             // gets the empty reply between them up front (see endsAfterTools)
-            const model = chatOf(body)?.model
+            const model = chat?.model
             // a system prompt WorkBuddy refused before goes as the user's
             // words at once (see systemAsUser)
-            const sysKey = native ? "" : systemKey(body)
-            if (sysKey && refusedSystems.has(sysKey)) body = systemAsUser(body) ?? body
+            const sysKey = native ? "" : systemKeyOf(chat)
+            if (sysKey && refusedSystems.has(sysKey) && systemAsUserOn(chat)) changed = true
+            // a system prompt whose comma passed once goes with the comma
+            // set before the first send (see commaSystems), the way one
+            // refused before goes moved above
+            if (sysKey && commaSystems.has(sysKey) && commaPausedOn(chat)) changed = true
+            // shaped is a body as such a model takes it. The first try's
+            // is made on the chat already parsed, after the move above,
+            // as shaped would make it of the body written; a resend with
+            // the system prompt moved (below) is shaped again, and a body
+            // that has the reply already is left as it is.
             const shaped = (b) => (!native && endsAfterTools.has(model) ? replyAfterTools(b) ?? b : b)
-            let res = await send(shaped(body))
+            if (!native && endsAfterTools.has(model) && replyAfterToolsOn(chat)) changed = true
+            if (changed) body = JSON.stringify(chat)
+            chat = null
+            let res = await send(body)
             // a signature WorkBuddy's own signing didn't make — a session
             // moved here from another provider keeps its thinking blocks,
             // and a truncated or altered one reads the same way — is 11159
@@ -2184,7 +3842,27 @@ function makePlugin(site) {
               else res = new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers })
             }
             if (res.status === 400 && !native) {              let text = await res.text()
-              const moved = REFUSED.test(text) && sysKey && !refusedSystems.has(sysKey) ? systemAsUser(body) : null
+              // the vendor may know a shape of the agent's opening that FLAGGED
+              // doesn't: the same words said with one more comma pass it, and
+              // that is tried before the system prompt is moved out of its slot.
+              // The roles the comma went into are kept: one set in the system
+              // prompt is what its next chats go with, one set in an assistant
+              // message alone says nothing about the next chat's.
+              const roles = new Set()
+              const paused = REFUSED.test(text) ? commaPaused(body, roles) : null
+              if (paused) {
+                body = paused
+                res = await send(shaped(body))
+                if (res.status === 400) text = await res.text()
+                // not refused this time: the comma is what passed the
+                // vendor's check, so this system prompt's next chats go
+                // with it set before the first send
+                else if (sysKey && roles.has("system")) {
+                  commaSystems.add(sysKey)
+                  if (commaSystems.size > 256) commaSystems.delete(commaSystems.values().next().value)
+                }
+              }
+              const moved = res.status === 400 && REFUSED.test(text) && sysKey && !refusedSystems.has(sysKey) ? systemAsUser(body) : null
               if (moved) {
                 refusedSystems.add(sysKey)
                 if (refusedSystems.size > 256) refusedSystems.delete(refusedSystems.values().next().value)
@@ -2202,7 +3880,7 @@ function makePlugin(site) {
             }
             if (ours.has(res)) return res
             // renewed here: a mark the account had comes off
-            return res.status >= 400 ? explained(res) : kept(native ? res : await renamed(res, names), renewed ? "renewed" : "kept")
+            return res.status >= 400 ? explained(res) : kept(native ? res : unsaid(await renamed(res, names)), renewed ? "renewed" : "kept")
           },
         }
       },
@@ -2211,6 +3889,9 @@ function makePlugin(site) {
       // an account lapsed nor cleared it, but for a 401 (gone, below)
       async usage(getAuth) {
         const auth = await getAuth()
+        // WorkBuddy's own CLI reads no credits with a key, and what the
+        // billing API answers one is unknown, so a key's card says so
+        if (auth?.type === "api") return { error: `credits unknown with an API key (WorkBuddy's own client reads none with one); see ${site.keys.replace(/\/profile\/keys$/, "")}`, signIn: "kept" }
         if (auth?.type !== "oauth" || !(auth.access || auth.source)) return { error: "not signed in", signIn: "kept" }
         try {
           let a = await current(site, client, auth)
@@ -2237,7 +3918,7 @@ function makePlugin(site) {
             }
             said = "renewed"
           }
-          const out = usageOf(sum, auth.plan)
+          const out = usageOf(sum, auth.plan, site)
           // an enterprise account's summary has no packages: its credits
           // are the enterprise meter's (#1904). A personal account's
           // refusal of it (10001 "uid or enterpriseID is empty") leaves
@@ -2252,14 +3933,61 @@ function makePlugin(site) {
           // when the plan's credits start again (cycleOf), and when the credits
           // left run out, for routing to spend them first (runsOutOf);
           // a list that can't be read leaves it unknown, the card stands
+          //
+          // Split (usageOf), the plan's cycle is the plan window's alone;
+          // the soonest credits to lapse, of any package, stay on the window
+          // that stops the account, as routing reads none set aside, and
+          // the window set aside says its own.
           const credits = out.windows.find((w) => w.name === "Credits")
+          const extra = out.windows.find((w) => w.name === "Extra credits")
           if (credits) {
             try {
               const packages = await packagesOf(site, a)
-              Object.assign(credits, cycleOf(sum, packages) ?? {}, runsOutOf(sum, packages) ?? {})
+              Object.assign(credits, cycleOf(sum, packages) ?? {})
+              const ofPlan = planCodes(sum, site)
+              const stops = extra && !extra.aside ? extra : credits
+              Object.assign(stops, runsOutOf(sum, packages) ?? {})
+              const aside = extra ? (stops === credits ? extra : credits) : null
+              if (aside) Object.assign(aside, runsOutOf(sum, packages, Date.now(), (code) => ofPlan(code) === (aside === credits)) ?? {})
+              // the summary of the plan's credits alone: the extra ones
+              // only the detail lists have (listedExtra) are their window,
+              // always set aside. Whether WorkBuddy spends them once the
+              // plan's are gone isn't seen, so the plan's window stops the
+              // account as it did before.
+              const kinds = !extra && kindsOf(sum, site)
+              const more = kinds && kinds.plan.total > 0 && kinds.extra.total === 0 ? listedExtra(sum, packages, site) : null
+              if (more) {
+                const { runsOutAt, runsOut, ...counts } = more
+                const w = { ...creditWindow("Extra credits", counts), aside: true, ...(runsOutAt ? { runsOutAt, runsOut } : {}) }
+                out.windows.splice(out.windows.indexOf(credits) + 1, 0, w)
+                // and, as with the split's, the soonest of them to lapse is
+                // the account's too, on the window that stops it: routing
+                // reads none set aside, so an account whose extra credits
+                // expire first went unknown to it (Kayphoon on Discord)
+                const at = runsOutAt ? Date.parse(runsOutAt) : 0
+                const was = credits.runsOutAt ? Date.parse(credits.runsOutAt) : 0
+                if (at > 0 && (!was || at < was)) Object.assign(credits, { runsOutAt, runsOut })
+                else if (at > 0 && at === was) credits.runsOut = (credits.runsOut ?? 0) + runsOut
+              }
             } catch {}
           }
           await spareFree(site, a, out.windows)
+          // each measured model's own window, which the credit meter above
+          // does not show: what actually refuses a chat long before the
+          // credits are spent. WorkBuddy AI has one (deepseek, 1e8, ten days
+          // of refusals); the China build's are measured one model at a time
+          // (deepseek at about 2e8, 2026-11-02), each its own card. Shown
+          // only, set aside: the vendor's refusal is what stops a model
+          // (see the window definitions above)
+          {
+            const account = a.accountId || a.user || a.uid || ""
+            const wins = site.ai ? [FREE_WINDOW_AI] : CN_ESTIMATED_WINDOWS
+            for (const win of wins) {
+              const rows = freeWindowRows(account, Date.now(), process.cwd(), process.env, homedir(), win)
+              const w = rows && freeWindowOf(rows, account, Date.now(), win)
+              if (w) out.windows.push(w)
+            }
+          }
           return { ...out, signIn: said }
         } catch (e) {
           return { error: e?.message ?? String(e), signIn: "kept" }
@@ -2281,9 +4009,17 @@ function makePlugin(site) {
           label: `${site.name} 导入登录 JSON`,
           authorize: () => importSignIn(site),
         },
+        {
+          // a key made at site.keys, sent as WorkBuddy's CLI sends one
+          // (keyAccount)
+          type: "api",
+          label: `${site.name} API key`,
+          placeholder: `from ${site.keys.replace(/^https:\/\//, "")}`,
+        },
       ],
     },
-  })
+  }
+  }
 }
 
 // REFUSED_HINT is what the user can do about WorkBuddy's "Illegal API
@@ -2297,6 +4033,13 @@ function makePlugin(site) {
 // apart from WorkBuddy's own words.
 const REFUSED_HINT =
   "WorkBuddy refused words in this client's prompt (most often its system prompt); use it from Hermes, OpenCode or Pi, or add another provider to this group"
+
+// REFUSED_DOC is where a refusal's fix is written down, for whoever holds the
+// error next: the person reading it, or the agent they paste it to. It goes
+// before the hint, never after, because magpie's Routing page tells the hint
+// from WorkBuddy's own words by the error ending in it.
+const REFUSED_DOC = "https://github.com/magpie-community/plugins/blob/main/packages/workbuddy/REFUSED.md"
+
 const REFUSED = /unapproved channel|illegal api invocation/i
 
 // BAD_SIGNATURE is WorkBuddy's refusal of a thinking block whose signature it
@@ -2375,7 +4118,11 @@ async function explained(res) {
   const hint = isRefused ? REFUSED_HINT : isRestricted ? RESTRICTED_HINT : EXHAUSTED_HINT
   const type = isRefused || isRestricted ? "permission_error" : "insufficient_quota"
   const errCode = isRefused ? null : isRestricted ? RESTRICTED_CODE : 14018
-  msg = `${msg} — ${hint}`
+  // a refusal says where its fix is written down, so whoever holds the error
+  // — the person, or the agent they paste it to — can go and read it. It goes
+  // before the hint, never after: the hint is the message's end.
+  const where = isRefused ? `${REFUSED_DOC} — ` : ""
+  msg = `${msg} — ${where}${hint}`
   const headers = new Headers(res.headers)
   headers.set("content-type", "application/json")
   headers.delete("content-length")
@@ -2388,4 +4135,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { cycleOf, typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, importSignIn, parseImport, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, answeredBefore, nativeOf, modelOf, configModels, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
+export const _internal = { planCodes, listedExtra, idFor, OFF_TAKEN, replyAfterToolsOn, withDefaultEffort, SMALL_BUDGET, defaultEffortOf, gzipped, FREE_ONLY, PRICE_TTL, keyAccount, remoteConfig, cycleOf, typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, accountName, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, importSignIn, parseImport, withSystem, asReasoning, normalizeToolChoice, fitTools, fitted, renamed, unsaid, FILTER_SAYS, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, REFUSED_DOC, commaPaused, commaPausedOn, opened, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, scopeOf, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, prepared, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, pinned, pinning, rowTime, rowAccount, ofAccount, windowOffset, windowReset, CN_ESTIMATED_WINDOWS, FREE_WINDOW_AI, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, checkinOf, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
