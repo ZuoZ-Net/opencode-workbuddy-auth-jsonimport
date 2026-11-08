@@ -1800,53 +1800,117 @@ function success(site, a, name) {
   }
 }
 
-// parseImport reads a pasted WorkBuddy sign-in JSON into the token shape the
-// rest of the plugin uses. It accepts WorkBuddy desktop's ".info" file as a
-// whole ({ account, auth }), or a flat token object ({ accessToken, ... }).
-// Unlike readDesktop it does NOT mark the result source:"desktop": the
-// imported sign-in is stored and renewed like a browser sign-in, so its
-// refresh token is this account's (import it on one machine at a time).
-function parseImport(text) {
-  const f = JSON.parse(text)
-  const t = f?.auth && typeof f.auth === "object" ? f.auth : f
-  const acct = f?.account && typeof f.account === "object" ? f.account : f
+// msOf normalizes an expiry to epoch milliseconds: a value below 1e12 is read
+// as seconds and scaled up, a larger one is already milliseconds, and an
+// "<n> seconds from now" field (expiresIn / refreshExpiresIn) is added to now.
+// 0 means none — refreshed before its first use.
+function msOf(at, within, now) {
+  const n = Number(at)
+  if (Number.isFinite(n) && n > 0) return n < 1e12 ? n * 1000 : n
+  const s = Number(within)
+  if (Number.isFinite(s) && s > 0) return now + s * 1000
+  return 0
+}
+
+// stripMd turns a markdown link "[text](url)" into its text and leaves any
+// other string as it is: some exporters wrap the domain as a markdown link.
+function stripMd(s) {
+  if (typeof s !== "string") return ""
+  const m = s.match(/^\[([^\]]+)\]\(/)
+  return (m ? m[1] : s).trim()
+}
+
+// mapAccount reads ONE account into the token shape the plugin stores. It
+// accepts WorkBuddy desktop's ".info" ({ account, auth }), a flat token object
+// ({ accessToken, ... }), or one entry of a "workbuddy-accounts" export. Unlike
+// readDesktop it does NOT mark source:"desktop": the imported sign-in is stored
+// and renewed like a browser sign-in, so its refresh token is this account's
+// (import a given account on one machine at a time). Returns { acct } with the
+// token, or { skip } with why it was left out.
+function mapAccount(obj) {
+  if (!obj || typeof obj !== "object") return { skip: "不是对象" }
+  const t = obj.auth && typeof obj.auth === "object" ? obj.auth : obj
+  const acct = obj.account && typeof obj.account === "object" ? obj.account : obj
+  const name = acct?.nickname || acct?.phoneNumber || acct?.uid || t?.uid || "account"
   if (t?.accessToken?.$wbEncrypted || t?.refreshToken?.$wbEncrypted)
-    throw new Error("这是 WorkBuddy 5.6+ 的加密登录，magpie 读不了；请在 WorkBuddy 里退出重登后再导出，或用浏览器登录")
-  if (typeof t?.accessToken !== "string" || !t.accessToken) return null
-  const now = Date.now()
+    return { skip: `${name}: 加密登录（WorkBuddy 5.6+），读不了` }
+  if (typeof t?.accessToken !== "string" || !t.accessToken) return { skip: `${name}: 没有 accessToken` }
   const uid = acct?.uid ?? t.uid
-  if (!uid) return null
+  if (!uid) return { skip: `${name}: 没有 uid` }
+  const now = Date.now()
   const ent = acct?.enterpriseId ?? t.enterpriseId
   return {
-    access: t.accessToken,
-    refresh: typeof t.refreshToken === "string" ? t.refreshToken : "",
-    expires: t.expiresAt > 0 ? t.expiresAt : t.expiresIn > 0 ? now + t.expiresIn * 1000 : 0,
-    refreshExpiresAt: t.refreshExpiresAt > 0 ? t.refreshExpiresAt : t.refreshExpiresIn > 0 ? now + t.refreshExpiresIn * 1000 : 0,
-    domain: typeof t.domain === "string" ? t.domain : "",
-    tokenType: typeof t.tokenType === "string" ? t.tokenType : "",
-    uid,
-    ...(typeof ent === "string" && ent.trim() ? { enterpriseId: ent.trim() } : {}),
-    name: acct?.nickname || acct?.phoneNumber || uid,
+    acct: {
+      access: t.accessToken,
+      refresh: typeof t.refreshToken === "string" ? t.refreshToken : "",
+      expires: msOf(t.expiresAt, t.expiresIn, now),
+      refreshExpiresAt: msOf(t.refreshExpiresAt, t.refreshExpiresIn, now),
+      domain: stripMd(t.domain),
+      tokenType: typeof t.tokenType === "string" ? t.tokenType : "",
+      uid,
+      ...(typeof ent === "string" && ent.trim() ? { enterpriseId: ent.trim() } : {}),
+      name,
+    },
   }
 }
 
+// parseImport reads a single pasted sign-in (kept for the one-account path and
+// the tests). Returns the token, or null when there is nothing usable.
+function parseImport(text) {
+  const r = mapAccount(JSON.parse(text))
+  return r.acct ?? null
+}
+
+// parseImportAll reads one OR many accounts from a paste: a lone sign-in, a
+// bare array, or a "workbuddy-accounts" export ({ accounts: [...] }). It gives
+// the token for each importable account and a reason for each one left out.
+function parseImportAll(text) {
+  const data = JSON.parse(text)
+  const list = Array.isArray(data) ? data : Array.isArray(data?.accounts) ? data.accounts : [data]
+  const accounts = []
+  const skipped = []
+  for (const obj of list) {
+    const r = mapAccount(obj)
+    if (r.acct) accounts.push(r.acct)
+    else skipped.push(r.skip)
+  }
+  return { accounts, skipped }
+}
+
 // importSignIn is an added sign-in method: the user pastes WorkBuddy's sign-in
-// JSON (its desktop ".info" file, { account, auth }) and the plugin stores it
-// as a normal, refreshable oauth sign-in. For a machine where WorkBuddy
-// desktop isn't installed, or to carry a sign-in between machines.
-function importSignIn(site) {
+// JSON and the plugin stores it as a normal, refreshable oauth sign-in. It
+// takes a lone sign-in (desktop's ".info", or a flat token object) OR a whole
+// "workbuddy-accounts" export, importing every account at once — the first is
+// this method's result and the rest are kept with client.auth.set, each at
+// <id>#<hash of its uid> so a re-import lands on the same slot (no duplicates).
+function importSignIn(site, client) {
   return {
     url: "",
-    instructions: `粘贴 ${site.name} 的登录 JSON（WorkBuddy 桌面端 auth 的 .info 文件内容，含 account 与 auth），回车确认。`,
+    instructions: `粘贴 ${site.name} 的登录 JSON：WorkBuddy 桌面端 auth 的 .info 文件内容（含 account 与 auth），或一份 workbuddy-accounts 批量导出（{ accounts: [...] }，支持一次导入多个账号）。回车确认。`,
     method: "code",
     async callback(text) {
+      let found
       try {
-        const a = parseImport((text ?? "").trim())
-        if (!a) return { type: "failed", error: "登录 JSON 里没有可用的 accessToken / uid" }
-        return success(site, a, a.name)
+        found = parseImportAll((text ?? "").trim())
       } catch (e) {
         return { type: "failed", error: "登录 JSON 解析失败：" + (e?.message ?? String(e)) }
       }
+      const { accounts, skipped } = found
+      if (!accounts.length)
+        return { type: "failed", error: "没有可导入的账号" + (skipped.length ? "：" + skipped.join("；") : "") }
+      // beyond the first, keep each account beside it at a stable id by its uid
+      for (const a of accounts.slice(1)) {
+        const id = site.id + "#" + createHash("sha256").update(String(a.uid)).digest("hex").slice(0, 8)
+        try {
+          const { type: _t, ...body } = success(site, a, a.name)
+          await client?.auth?.set?.({ path: { id }, body: { type: "oauth", ...body } })
+        } catch (e) {
+          skipped.push(`${a.name}: 存储失败 ${e?.message ?? e}`)
+        }
+      }
+      const first = success(site, accounts[0], accounts[0].name)
+      const notes = skipped.map((x) => "跳过 " + x)
+      return accounts.length > 1 ? { ...first, count: accounts.length, notes } : first
     },
   }
 }
@@ -4007,7 +4071,7 @@ function makePlugin(site) {
         {
           type: "oauth",
           label: `${site.name} 导入登录 JSON`,
-          authorize: () => importSignIn(site),
+          authorize: () => importSignIn(site, client),
         },
         {
           // a key made at site.keys, sent as WorkBuddy's CLI sends one
@@ -4135,4 +4199,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { planCodes, listedExtra, idFor, OFF_TAKEN, replyAfterToolsOn, withDefaultEffort, SMALL_BUDGET, defaultEffortOf, gzipped, FREE_ONLY, PRICE_TTL, keyAccount, remoteConfig, cycleOf, typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, accountName, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, importSignIn, parseImport, withSystem, asReasoning, normalizeToolChoice, fitTools, fitted, renamed, unsaid, FILTER_SAYS, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, REFUSED_DOC, commaPaused, commaPausedOn, opened, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, scopeOf, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, prepared, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, pinned, pinning, rowTime, rowAccount, ofAccount, windowOffset, windowReset, CN_ESTIMATED_WINDOWS, FREE_WINDOW_AI, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, checkinOf, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
+export const _internal = { planCodes, listedExtra, idFor, OFF_TAKEN, replyAfterToolsOn, withDefaultEffort, SMALL_BUDGET, defaultEffortOf, gzipped, FREE_ONLY, PRICE_TTL, keyAccount, remoteConfig, cycleOf, typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, accountName, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, importSignIn, parseImport, parseImportAll, mapAccount, withSystem, asReasoning, normalizeToolChoice, fitTools, fitted, renamed, unsaid, FILTER_SAYS, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, REFUSED_DOC, commaPaused, commaPausedOn, opened, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, scopeOf, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, prepared, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, pinned, pinning, rowTime, rowAccount, ofAccount, windowOffset, windowReset, CN_ESTIMATED_WINDOWS, FREE_WINDOW_AI, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, checkinOf, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
